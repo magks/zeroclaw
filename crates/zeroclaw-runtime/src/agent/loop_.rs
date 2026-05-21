@@ -55,6 +55,7 @@ use zeroclaw_memory::{
 use zeroclaw_providers::multimodal;
 use zeroclaw_providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    reliable::{ProviderFallbackInfo, scope_provider_fallback, take_last_provider_fallback},
 };
 
 // Cost tracking moved to `super::cost`.
@@ -1130,64 +1131,113 @@ pub async fn run_tool_call_loop(
         );
         let mut streamed_live_deltas = false;
 
-        let chat_result = if should_consume_provider_stream {
-            match consume_provider_streaming_response(
-                active_provider,
-                &prepared_messages.messages,
-                request_tools,
-                active_model,
-                temperature,
-                cancellation_token.as_ref(),
-                on_delta.as_ref(),
-            )
-            .await
-            {
-                Ok(streamed) => {
-                    streamed_live_deltas = streamed.forwarded_live_deltas;
-                    let reasoning_content = if streamed.reasoning_content.is_empty() {
-                        None
-                    } else {
-                        Some(streamed.reasoning_content)
-                    };
-                    Ok(zeroclaw_providers::ChatResponse {
-                        text: Some(streamed.response_text),
-                        tool_calls: streamed.tool_calls,
-                        usage: streamed.usage,
-                        reasoning_content,
-                    })
-                }
-                Err(stream_err) => {
-                    tracing::warn!(
-                        provider = active_provider_name,
-                        model = active_model,
-                        iteration = iteration + 1,
-                        "provider streaming failed, falling back to non-streaming chat: {stream_err}"
-                    );
-                    runtime_trace::record_event(
-                        "llm_stream_fallback",
-                        Some(channel_name),
-                        Some(active_provider_name),
-                        Some(active_model),
-                        Some(&turn_id),
-                        Some(false),
-                        Some("provider stream failed; fallback to non-streaming chat"),
-                        serde_json::json!({
-                            "iteration": iteration + 1,
-                            "error": scrub_credentials(&stream_err.to_string()),
-                        }),
-                    );
-                    {
-                        let chat_future = active_provider.chat(
-                            ChatRequest {
-                                messages: &prepared_messages.messages,
-                                tools: request_tools,
-                            },
-                            active_model,
-                            Some(temperature),
+        let (chat_result, provider_fallback_info): (Result<zeroclaw_providers::ChatResponse, anyhow::Error>, Option<ProviderFallbackInfo>) = scope_provider_fallback(async {
+            let chat_result = if should_consume_provider_stream {
+                match consume_provider_streaming_response(
+                    active_provider,
+                    &prepared_messages.messages,
+                    request_tools,
+                    active_model,
+                    temperature,
+                    cancellation_token.as_ref(),
+                    on_delta.as_ref(),
+                )
+                .await
+                {
+                    Ok(streamed) => {
+                        streamed_live_deltas = streamed.forwarded_live_deltas;
+                        let reasoning_content = if streamed.reasoning_content.is_empty() {
+                            None
+                        } else {
+                            Some(streamed.reasoning_content)
+                        };
+                        Ok(zeroclaw_providers::ChatResponse {
+                            text: Some(streamed.response_text),
+                            tool_calls: streamed.tool_calls,
+                            usage: streamed.usage,
+                            reasoning_content,
+                        })
+                    }
+                    Err(stream_err) => {
+                        tracing::warn!(
+                            provider = active_provider_name,
+                            model = active_model,
+                            iteration = iteration + 1,
+                            "provider streaming failed, falling back to non-streaming chat: {stream_err}"
                         );
+                        runtime_trace::record_event(
+                            "llm_stream_fallback",
+                            Some(channel_name),
+                            Some(active_provider_name),
+                            Some(active_model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some("provider stream failed; fallback to non-streaming chat"),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "error": scrub_credentials(&stream_err.to_string()),
+                            }),
+                        );
+                        {
+                            let chat_future = active_provider.chat(
+                                ChatRequest {
+                                    messages: &prepared_messages.messages,
+                                    tools: request_tools,
+                                },
+                                active_model,
+                                Some(temperature),
+                            );
+                            if let Some(token) = cancellation_token.as_ref() {
+                                tokio::select! {
+                                    () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                    result = chat_future => result,
+                                }
+                            } else {
+                                chat_future.await
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Non-streaming path: wrap with optional per-step timeout from
+                // pacing config to catch hung model responses.
+                let chat_future = active_provider.chat(
+                    ChatRequest {
+                        messages: &prepared_messages.messages,
+                        tools: request_tools,
+                    },
+                    active_model,
+                    Some(temperature),
+                );
+
+                match pacing.step_timeout_secs {
+                    Some(step_secs) if step_secs > 0 => {
+                        let step_timeout = Duration::from_secs(step_secs);
                         if let Some(token) = cancellation_token.as_ref() {
                             tokio::select! {
-                                () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                                result = tokio::time::timeout(step_timeout, chat_future) => {
+                                    match result {
+                                        Ok(inner) => inner,
+                                        Err(_) => anyhow::bail!(
+                                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                                        ),
+                                    }
+                                },
+                            }
+                        } else {
+                            match tokio::time::timeout(step_timeout, chat_future).await {
+                                Ok(inner) => inner,
+                                Err(_) => anyhow::bail!(
+                                    "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                                ),
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(token) = cancellation_token.as_ref() {
+                            tokio::select! {
+                                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
                                 result = chat_future => result,
                             }
                         } else {
@@ -1195,55 +1245,10 @@ pub async fn run_tool_call_loop(
                         }
                     }
                 }
-            }
-        } else {
-            // Non-streaming path: wrap with optional per-step timeout from
-            // pacing config to catch hung model responses.
-            let chat_future = active_provider.chat(
-                ChatRequest {
-                    messages: &prepared_messages.messages,
-                    tools: request_tools,
-                },
-                active_model,
-                Some(temperature),
-            );
-
-            match pacing.step_timeout_secs {
-                Some(step_secs) if step_secs > 0 => {
-                    let step_timeout = Duration::from_secs(step_secs);
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = tokio::time::timeout(step_timeout, chat_future) => {
-                                match result {
-                                    Ok(inner) => inner,
-                                    Err(_) => anyhow::bail!(
-                                        "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                                    ),
-                                }
-                            },
-                        }
-                    } else {
-                        match tokio::time::timeout(step_timeout, chat_future).await {
-                            Ok(inner) => inner,
-                            Err(_) => anyhow::bail!(
-                                "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                            ),
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = chat_future => result,
-                        }
-                    } else {
-                        chat_future.await
-                    }
-                }
-            }
-        };
+            };
+            Ok::<(Result<zeroclaw_providers::ChatResponse, anyhow::Error>, Option<ProviderFallbackInfo>), anyhow::Error>((chat_result, take_last_provider_fallback()))
+        })
+        .await?;
 
         let (
             response_text,
@@ -1335,6 +1340,27 @@ pub async fn run_tool_call_loop(
                     );
                 }
 
+                let mut llm_response_payload = serde_json::json!({
+                    "iteration": iteration + 1,
+                    "duration_ms": llm_started_at.elapsed().as_millis(),
+                    "input_tokens": resp_input_tokens,
+                    "output_tokens": resp_output_tokens,
+                    "raw_response": scrub_credentials(&response_text),
+                    "native_tool_calls": resp.tool_calls.len(),
+                    "parsed_tool_calls": calls.len(),
+                });
+                if let Some(fb) = provider_fallback_info.as_ref()
+                    && let Some(map) = llm_response_payload.as_object_mut()
+                {
+                    map.insert(
+                        "actual_provider".to_string(),
+                        serde_json::Value::String(fb.actual_provider.clone()),
+                    );
+                    map.insert(
+                        "actual_model".to_string(),
+                        serde_json::Value::String(fb.actual_model.clone()),
+                    );
+                }
                 runtime_trace::record_event(
                     "llm_response",
                     Some(channel_name),
@@ -1343,15 +1369,7 @@ pub async fn run_tool_call_loop(
                     Some(&turn_id),
                     Some(true),
                     None,
-                    serde_json::json!({
-                        "iteration": iteration + 1,
-                        "duration_ms": llm_started_at.elapsed().as_millis(),
-                        "input_tokens": resp_input_tokens,
-                        "output_tokens": resp_output_tokens,
-                        "raw_response": scrub_credentials(&response_text),
-                        "native_tool_calls": resp.tool_calls.len(),
-                        "parsed_tool_calls": calls.len(),
-                    }),
+                    llm_response_payload,
                 );
 
                 // Preserve native tool call IDs in assistant history so role=tool
