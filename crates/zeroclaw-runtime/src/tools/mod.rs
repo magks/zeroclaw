@@ -1308,6 +1308,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
 

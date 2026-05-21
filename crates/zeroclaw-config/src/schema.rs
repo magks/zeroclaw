@@ -739,6 +739,31 @@ pub struct DelegateAgentConfig {
     /// preventing cross-contamination with memory from other agents.
     #[serde(default)]
     pub memory_namespace: Option<String>,
+    /// Optional fallback provider name. When set together with
+    /// `fallback_model`, the delegate retries the primary call against this
+    /// provider+model if the primary errors out (timeout, network failure,
+    /// rate limit, etc.). One-level fallback only — the fallback itself is
+    /// not retried. Non-agentic delegates only at present.
+    ///
+    /// Typical use case: route a delegate to a fast remote model (Z.AI,
+    /// OpenAI) for cost/quality, but fall back to a local Ollama model
+    /// when the remote is unavailable or rate-limited. Privacy-sensitive
+    /// agents should NOT set a fallback that leaks data — only set this
+    /// when both primary and fallback are acceptable for the data class.
+    #[serde(default)]
+    pub fallback_provider: Option<String>,
+    /// Optional fallback model name. Paired with `fallback_provider`;
+    /// fallback only activates if BOTH are set.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+    /// Optional API key override for the fallback provider. When `None`,
+    /// the fallback provider uses its own environment-variable key
+    /// (e.g. `OLLAMA_API_KEY`, `ANTHROPIC_API_KEY`), same resolution
+    /// path as a primary provider without `api_key` set.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub fallback_api_key: Option<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -13239,6 +13264,63 @@ reasoning_effort = "turbo"
     }
 
     #[test]
+    async fn delegate_agent_config_fallback_fields_default_to_none() {
+        let cfg = DelegateAgentConfig::default();
+        assert!(cfg.fallback_provider.is_none());
+        assert!(cfg.fallback_model.is_none());
+        assert!(cfg.fallback_api_key.is_none());
+    }
+
+    #[test]
+    async fn delegate_agent_config_parses_fallback_fields_from_toml() {
+        // Verify the [agents.<name>] block accepts fallback_provider /
+        // fallback_model / fallback_api_key — the primitive needed for
+        // tiered routing (Z.AI primary, local fallback on rate-limit/down).
+        let raw = r#"
+[agents.comment_drafter_tiered]
+provider = "zai"
+model = "glm-5-turbo"
+temperature = 0.4
+fallback_provider = "ollama"
+fallback_model = "qwen3.5:9b"
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        let agent = parsed
+            .agents
+            .get("comment_drafter_tiered")
+            .expect("agent must parse");
+        assert_eq!(agent.provider, "zai");
+        assert_eq!(agent.model, "glm-5-turbo");
+        assert_eq!(agent.fallback_provider.as_deref(), Some("ollama"));
+        assert_eq!(agent.fallback_model.as_deref(), Some("qwen3.5:9b"));
+        assert!(
+            agent.fallback_api_key.is_none(),
+            "fallback_api_key should be None when not set in TOML"
+        );
+    }
+
+    #[test]
+    async fn delegate_agent_config_fallback_api_key_parses() {
+        // Separate test for the api_key field — it's marked #[secret] so
+        // serialization differs slightly. Verify it round-trips.
+        let raw = r#"
+[agents.tiered_with_key]
+provider = "zai"
+model = "glm-5-turbo"
+fallback_provider = "anthropic"
+fallback_model = "claude-3-5-haiku"
+fallback_api_key = "sk-fb-test"
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        let agent = parsed
+            .agents
+            .get("tiered_with_key")
+            .expect("agent must parse");
+        assert_eq!(agent.fallback_api_key.as_deref(), Some("sk-fb-test"));
+    }
+
+    #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(cfg.compact_context);
@@ -13503,6 +13585,9 @@ default_temperature = 0.7
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
 

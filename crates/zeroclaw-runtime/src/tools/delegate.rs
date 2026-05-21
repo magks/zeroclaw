@@ -503,57 +503,160 @@ impl DelegateTool {
             self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir);
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
-        // Wrap the provider call in a timeout to prevent indefinite blocking
         let timeout_secs = agent_config
             .timeout_secs
             .unwrap_or(self.delegate_config.timeout_secs);
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            provider.chat_with_system(
-                system_prompt_ref,
-                &full_prompt,
-                &agent_config.model,
-                agent_config.temperature,
-            ),
+
+        // Primary provider attempt.
+        let primary_result = execute_provider_call(
+            &*provider,
+            system_prompt_ref,
+            &full_prompt,
+            &agent_config.model,
+            agent_config.temperature,
+            timeout_secs,
         )
         .await;
 
-        let result = match result {
-            Ok(inner) => inner,
-            Err(_elapsed) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' timed out after {timeout_secs}s"
-                    )),
-                });
+        // Determine which provider+model actually served the response, and
+        // whether the configured fallback (if any) was activated.
+        let (response, served_provider, served_model, fallback_used) = match primary_result {
+            Ok(resp) => (
+                resp,
+                agent_config.provider.clone(),
+                agent_config.model.clone(),
+                false,
+            ),
+            Err(primary_err) => {
+                // Fallback is one-level only and requires BOTH a fallback
+                // provider and a fallback model to be configured. If only one
+                // is set, treat the config as primary-only and surface the
+                // primary error unchanged.
+                match (
+                    agent_config.fallback_provider.as_deref(),
+                    agent_config.fallback_model.as_deref(),
+                ) {
+                    (Some(fb_provider_name), Some(fb_model)) => {
+                        // Resolve credential for the fallback provider:
+                        // explicit fallback_api_key wins, otherwise drop to
+                        // the runtime's environment-var resolution (Ollama
+                        // doesn't need a key; remote providers fall back to
+                        // OLLAMA_API_KEY / ZAI_API_KEY / etc.).
+                        let fb_credential_owned = agent_config.fallback_api_key.clone();
+                        let fb_credential = fb_credential_owned.as_deref();
+
+                        let fb_provider = match zeroclaw_providers::create_provider_with_options(
+                            fb_provider_name,
+                            fb_credential,
+                            &self.provider_runtime_options,
+                        ) {
+                            Ok(p) => p,
+                            Err(fb_construction_err) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!(
+                                        "Agent '{agent_name}' failed (primary {provider}/{model}: {primary_err}); fallback provider '{fb_provider_name}' construction also failed: {fb_construction_err}",
+                                        provider = agent_config.provider,
+                                        model = agent_config.model
+                                    )),
+                                });
+                            }
+                        };
+
+                        tracing::warn!(
+                            target: "zeroclaw_runtime::observability::log",
+                            agent = agent_name,
+                            primary_provider = %agent_config.provider,
+                            primary_model = %agent_config.model,
+                            fallback_provider = fb_provider_name,
+                            fallback_model = fb_model,
+                            error = %primary_err,
+                            "delegate primary call failed; attempting fallback"
+                        );
+
+                        let fb_result = execute_provider_call(
+                            &*fb_provider,
+                            system_prompt_ref,
+                            &full_prompt,
+                            fb_model,
+                            agent_config.temperature,
+                            timeout_secs,
+                        )
+                        .await;
+
+                        match fb_result {
+                            Ok(resp) => (
+                                resp,
+                                fb_provider_name.to_string(),
+                                fb_model.to_string(),
+                                true,
+                            ),
+                            Err(fb_err) => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!(
+                                        "Agent '{agent_name}' failed on both primary ({primary_provider}/{primary_model}: {primary_err}) and fallback ({fb_provider_name}/{fb_model}: {fb_err})",
+                                        primary_provider = agent_config.provider,
+                                        primary_model = agent_config.model,
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        // No fallback configured (or only partially configured)
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Agent '{agent_name}' failed: {primary_err}"
+                            )),
+                        });
+                    }
+                }
             }
         };
 
-        match result {
-            Ok(response) => {
-                let mut rendered = response;
-                if rendered.trim().is_empty() {
-                    rendered = "[Empty response]".to_string();
-                }
-
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
-                        provider = agent_config.provider,
-                        model = agent_config.model
-                    ),
-                    error: None,
-                })
-            }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-            }),
+        let mut rendered = response;
+        if rendered.trim().is_empty() {
+            rendered = "[Empty response]".to_string();
         }
+
+        let tier_label = if fallback_used { " [via fallback]" } else { "" };
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "[Agent '{agent_name}' ({served_provider}/{served_model}){tier_label}]\n{rendered}"
+            ),
+            error: None,
+        })
+    }
+}
+
+/// Execute a single non-agentic provider chat call wrapped in a timeout.
+/// Returns `Ok(response_text)` on success, or an `Err` describing either
+/// the timeout or the provider-side failure. Caller decides whether to
+/// fall back to a secondary provider.
+async fn execute_provider_call(
+    provider: &dyn zeroclaw_api::provider::Provider,
+    system: Option<&str>,
+    user_prompt: &str,
+    model: &str,
+    temperature: Option<f64>,
+    timeout_secs: u64,
+) -> anyhow::Result<String> {
+    let timed = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        provider.chat_with_system(system, user_prompt, model, temperature),
+    )
+    .await;
+
+    match timed {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Err(anyhow::anyhow!("timed out after {timeout_secs}s")),
     }
 }
 
@@ -1350,6 +1453,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         agents.insert(
@@ -1368,6 +1474,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         agents
@@ -1556,6 +1665,9 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         }
     }
 
@@ -1672,6 +1784,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1786,6 +1901,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1827,6 +1945,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2211,6 +2332,9 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2265,6 +2389,9 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         };
 
         struct MockShellTool;
@@ -2336,6 +2463,9 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2365,6 +2495,9 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2399,6 +2532,9 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2455,6 +2591,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2483,6 +2622,9 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2511,6 +2653,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2539,6 +2684,9 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2567,6 +2715,9 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2591,6 +2742,9 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                fallback_provider: None,
+                fallback_model: None,
+                fallback_api_key: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2624,6 +2778,9 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2671,6 +2828,9 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            fallback_provider: None,
+            fallback_model: None,
+            fallback_api_key: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
