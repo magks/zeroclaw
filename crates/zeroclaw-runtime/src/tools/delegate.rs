@@ -1,5 +1,6 @@
 use crate::agent::loop_::{TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::observability::runtime_trace;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -14,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::{DelegateAgentConfig, DelegateToolConfig};
 use zeroclaw_memory::{Memory, NamespacedMemory};
-use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_providers::{self, ChatMessage, ChatRequest, Provider};
 
 /// Fallback temperature for sub-agent tool loops when the delegate config
 /// leaves it unset; matches the longstanding agentic default that balances
@@ -508,6 +509,7 @@ impl DelegateTool {
             .unwrap_or(self.delegate_config.timeout_secs);
 
         // Primary provider attempt.
+        let inner_started_at = std::time::Instant::now();
         let primary_result = execute_provider_call(
             &*provider,
             system_prompt_ref,
@@ -520,9 +522,10 @@ impl DelegateTool {
 
         // Determine which provider+model actually served the response, and
         // whether the configured fallback (if any) was activated.
-        let (response, served_provider, served_model, fallback_used) = match primary_result {
-            Ok(resp) => (
+        let (response, response_usage, served_provider, served_model, fallback_used) = match primary_result {
+            Ok((resp, usage)) => (
                 resp,
+                usage,
                 agent_config.provider.clone(),
                 agent_config.model.clone(),
                 false,
@@ -586,8 +589,9 @@ impl DelegateTool {
                         .await;
 
                         match fb_result {
-                            Ok(resp) => (
+                            Ok((resp, usage)) => (
                                 resp,
+                                usage,
                                 fb_provider_name.to_string(),
                                 fb_model.to_string(),
                                 true,
@@ -624,6 +628,25 @@ impl DelegateTool {
             rendered = "[Empty response]".to_string();
         }
 
+        runtime_trace::record_event(
+            "delegate_inner_call",
+            None,
+            Some(&served_provider),
+            Some(&served_model),
+            None,
+            Some(true),
+            None,
+            serde_json::json!({
+                "agent": agent_name,
+                "configured_provider": &agent_config.provider,
+                "configured_model": &agent_config.model,
+                "duration_ms": inner_started_at.elapsed().as_millis(),
+                "fallback_used": fallback_used,
+                "input_tokens": response_usage.as_ref().and_then(|u| u.input_tokens),
+                "output_tokens": response_usage.as_ref().and_then(|u| u.output_tokens),
+                "cached_input_tokens": response_usage.as_ref().and_then(|u| u.cached_input_tokens),
+            }),
+        );
         let tier_label = if fallback_used { " [via fallback]" } else { "" };
         Ok(ToolResult {
             success: true,
@@ -646,15 +669,27 @@ async fn execute_provider_call(
     model: &str,
     temperature: Option<f64>,
     timeout_secs: u64,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<zeroclaw_api::provider::TokenUsage>)> {
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    if let Some(sys) = system {
+        messages.push(ChatMessage::system(sys.to_string()));
+    }
+    messages.push(ChatMessage::user(user_prompt.to_string()));
+    let request = ChatRequest {
+        messages: &messages,
+        tools: None,
+    };
     let timed = tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        provider.chat_with_system(system, user_prompt, model, temperature),
+        provider.chat(request, model, temperature),
     )
     .await;
 
     match timed {
-        Ok(Ok(response)) => Ok(response),
+        Ok(Ok(response)) => {
+            let text = response.text.unwrap_or_default();
+            Ok((text, response.usage))
+        }
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => Err(anyhow::anyhow!("timed out after {timeout_secs}s")),
     }
