@@ -981,16 +981,13 @@ impl Provider for OllamaProvider {
                 .await;
         }
 
-        // No tools — fall back to plain text chat.
-        let text = self
-            .chat_with_history(request.messages, model, temperature)
-            .await?;
-        Ok(ChatResponse {
-            text: Some(text),
-            tool_calls: vec![],
-            usage: None,
-            reasoning_content: None,
-        })
+        // No tools — route through chat_with_tools with an empty tools slice
+        // so the resulting ChatResponse preserves the provider-reported usage
+        // (prompt_eval_count → input_tokens, eval_count → output_tokens).
+        // Functionally equivalent to chat_with_history for tool-less calls but
+        // does not discard the usage field.
+        self.chat_with_tools(request.messages, &[], model, temperature)
+            .await
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
