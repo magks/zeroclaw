@@ -142,6 +142,7 @@ pub use sop_status::SopStatusTool;
 pub use spawn_subagent::SpawnSubagentTool;
 pub use verifiable_intent::VerifiableIntentTool;
 
+use crate::observability::{NoopObserver, traits::Observer};
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
 use async_trait::async_trait;
@@ -370,6 +371,7 @@ pub fn all_tools(
         risk_profile,
         agent_alias,
         Arc::new(NativeRuntime::new()),
+        Arc::new(NoopObserver),
         memory,
         composio_key,
         composio_entity_id,
@@ -397,6 +399,7 @@ pub fn all_tools_with_runtime(
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
     agent_alias: &str,
     runtime: Arc<dyn RuntimeAdapter>,
+    observer: Arc<dyn Observer>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
@@ -1077,6 +1080,7 @@ pub fn all_tools_with_runtime(
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
         .with_memory(memory.clone())
+        .with_observer(observer.clone())
         .with_providers_models({
             // DelegateTool's signature still expects the flat HashMap shape;
             // collapse the typed ModelProviders container down to base-config

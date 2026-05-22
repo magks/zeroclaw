@@ -6898,6 +6898,7 @@ pub async fn start_channels(
             &risk_profile,
             agent_alias,
             Arc::clone(&runtime),
+            observer.clone(),
             Arc::clone(&mem),
             composio_key,
             composio_entity_id,

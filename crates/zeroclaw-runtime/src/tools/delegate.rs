@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::model_provider::ChatRequest;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::{
     AliasedAgentConfig, Config, DelegateToolConfig, ModelProviderConfig, RiskProfileConfig,
@@ -104,6 +105,10 @@ pub struct DelegateTool {
     /// unset (legacy unit-test constructors), DelegateTool falls back
     /// to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// Optional observer for emitting per-call `LlmResponse` telemetry from
+    /// non-agentic delegate runs (which bypass the agent loop's own emission).
+    /// `None` for legacy unit-test constructors — telemetry is simply skipped.
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl DelegateTool {
@@ -143,6 +148,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            observer: None,
         }
     }
 
@@ -188,6 +194,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            observer: None,
         }
     }
 
@@ -250,6 +257,13 @@ impl DelegateTool {
     /// Attach memory for namespace isolation on delegate agents.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach the runtime observer so non-agentic delegate calls emit a
+    /// per-call `LlmResponse` event (provider/model/duration/tokens).
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -797,13 +811,30 @@ impl DelegateTool {
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
+        // Assemble a (system?, user) message list so we can call chat() rather
+        // than chat_with_system(): chat() returns a ChatResponse whose `usage`
+        // we surface as a per-delegate LlmResponse observer event below.
+        // chat_with_system() returns only a String and discards token counts —
+        // non-agentic delegates bypass the agent loop, so without this they emit
+        // no inner-call telemetry at all (agentic delegates emit via the loop).
+        let mut inner_messages: Vec<ChatMessage> = Vec::with_capacity(2);
+        if let Some(system) = system_prompt_ref {
+            inner_messages.push(ChatMessage::system(system));
+        }
+        inner_messages.push(ChatMessage::user(full_prompt));
+        let chat_request = ChatRequest {
+            messages: &inner_messages,
+            tools: None,
+        };
+
         // Wrap the model_provider call in a timeout to prevent indefinite blocking
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
+        let inner_started_at = std::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            model_provider.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            model_provider.chat(chat_request, &model, temperature),
         )
         .await;
 
@@ -822,7 +853,29 @@ impl DelegateTool {
 
         match result {
             Ok(response) => {
-                let mut rendered = response;
+                // Per-delegate inner-call telemetry: emit an LlmResponse so
+                // zc-delegate-stats can attribute tokens + latency to this
+                // non-agentic delegate. provider/model are the configured ones
+                // (no cross-provider fallback on the delegate path in this
+                // build — see the deferred per-agent fallback work).
+                if let Some(observer) = &self.observer {
+                    let (input_tokens, output_tokens) = response
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+                    observer.record_event(&ObserverEvent::LlmResponse {
+                        model_provider: provider_type.clone(),
+                        model: model.clone(),
+                        duration: inner_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                        input_tokens,
+                        output_tokens,
+                    });
+                }
+
+                let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
                     rendered = "[Empty response]".to_string();
                 }
@@ -957,6 +1010,7 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        let observer = self.observer.clone();
         // Capture the parent loop's session-key task-local so the
         // detached background task scopes its tool calls under the
         // same key — channel tools (sessions_send, etc.) need the
@@ -984,6 +1038,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    observer,
                 };
 
                 let args_inner = json!({
@@ -1179,6 +1234,7 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            let observer = self.observer.clone();
             let session_key = parent_session_key.clone();
 
             handles.push(tokio::spawn(async move {
@@ -1199,6 +1255,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    observer,
                 };
                 let agent_name_for_return = agent_name.clone();
                 let result = scope_delegate_session_key(session_key, async move {
