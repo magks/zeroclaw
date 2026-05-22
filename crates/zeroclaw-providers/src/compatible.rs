@@ -624,6 +624,12 @@ struct ApiChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    /// Z.AI / GLM `thinking` control. Sent as `{"type": "disabled"}` for
+    /// glm-5.x models to skip the reasoning channel — without this the model
+    /// splits its token budget between reasoning + content, wasting ~75% of
+    /// tokens per call. See `auto_disable_thinking_for_glm5`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -638,6 +644,37 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+}
+
+/// Z.AI's `thinking` parameter shape. Z.AI accepts `{"type": "enabled"}`
+/// (default for glm-5.x) or `{"type": "disabled"}`. We only ever set
+/// disabled — enabled is the API default and omitting the field is
+/// equivalent.
+#[derive(Debug, Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// Decide whether to suppress the reasoning channel for the given model.
+///
+/// Z.AI's glm-5.x family (glm-5.1, glm-5-turbo, etc.) defaults to
+/// thinking-mode enabled, emitting the bulk of its tokens as
+/// `reasoning_content` rather than `content`. `effective_content()` falls
+/// back to reasoning_content so calls *work*, but waste ~75% of tokens
+/// (verified 2026-05-21: glm-5-turbo 1031 completion / 774 reasoning on a
+/// prompt that needs ~70 tokens with thinking disabled).
+///
+/// Returns `Some(disabled)` for glm-5.x; `None` otherwise (glm-4.x and any
+/// non-glm model routed through this provider keep the default behaviour).
+fn auto_disable_thinking_for_glm5(model: &str) -> Option<ThinkingConfig> {
+    if model.starts_with("glm-5") {
+        Some(ThinkingConfig {
+            kind: "disabled".to_string(),
+        })
+    } else {
+        None
+    }
 }
 
 /// OpenAI-compatible `stream_options.include_usage` toggle.
@@ -2101,6 +2138,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             stream: Some(false),
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
+            thinking: auto_disable_thinking_for_glm5(model),
             tool_stream: None,
             tools: None,
             tool_choice: None,
@@ -2188,6 +2226,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             stream: Some(false),
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
+            thinking: auto_disable_thinking_for_glm5(model),
             tool_stream: None,
             tools: None,
             tool_choice: None,
@@ -2269,6 +2308,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             stream: Some(false),
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
+            thinking: auto_disable_thinking_for_glm5(model),
             tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
             tools: if tools.is_empty() {
                 None
@@ -2546,6 +2586,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     messages,
                     temperature,
                     reasoning_effort: provider.reasoning_effort_for_model(&model),
+                    thinking: auto_disable_thinking_for_glm5(&model),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(false)
                     } else {
@@ -2695,6 +2736,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     include_usage: true,
                 }),
                 reasoning_effort: provider.reasoning_effort_for_model(&model),
+                thinking: auto_disable_thinking_for_glm5(&model),
                 tool_stream: None,
                 tools: None,
                 tool_choice: None,
@@ -2803,6 +2845,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     include_usage: true,
                 }),
                 reasoning_effort: provider.reasoning_effort_for_model(&model),
+                thinking: auto_disable_thinking_for_glm5(&model),
                 tool_stream: None,
                 tools: None,
                 tool_choice: None,
@@ -2890,6 +2933,78 @@ mod tests {
         key: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         OpenAiCompatibleModelProvider::new("test", name, url, key, AuthStyle::Bearer)
+    }
+
+    #[test]
+    fn auto_disable_thinking_for_glm5_models() {
+        // glm-5.x family defaults to thinking-enabled on Z.AI — disable.
+        assert!(auto_disable_thinking_for_glm5("glm-5.1").is_some());
+        assert!(auto_disable_thinking_for_glm5("glm-5-turbo").is_some());
+        assert!(auto_disable_thinking_for_glm5("glm-5").is_some());
+        // Confirm the kind string.
+        let cfg = auto_disable_thinking_for_glm5("glm-5.1").unwrap();
+        assert_eq!(cfg.kind, "disabled");
+    }
+
+    #[test]
+    fn auto_disable_thinking_omitted_for_non_glm5() {
+        // glm-4.x — no thinking-mode trap, omit the field (preserve default).
+        assert!(auto_disable_thinking_for_glm5("glm-4.7").is_none());
+        assert!(auto_disable_thinking_for_glm5("glm-4.5-air").is_none());
+        assert!(auto_disable_thinking_for_glm5("glm-4.6").is_none());
+        // Non-glm models routed through this model_provider — omit too.
+        assert!(auto_disable_thinking_for_glm5("gpt-4o").is_none());
+        assert!(auto_disable_thinking_for_glm5("claude-3-5-sonnet").is_none());
+    }
+
+    #[test]
+    fn thinking_field_serializes_for_glm5() {
+        let req = ApiChatRequest {
+            model: "glm-5-turbo".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            temperature: 0.4,
+            thinking: auto_disable_thinking_for_glm5("glm-5-turbo"),
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""thinking":{"type":"disabled"}"#),
+            "thinking.type=disabled missing for glm-5 request: {json}"
+        );
+    }
+
+    #[test]
+    fn thinking_field_omitted_for_non_glm5() {
+        let req = ApiChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+            }],
+            temperature: 0.4,
+            thinking: auto_disable_thinking_for_glm5("gpt-4o"),
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("thinking"),
+            "thinking field should be omitted for non-glm5: {json}"
+        );
     }
 
     #[test]
@@ -3010,6 +3125,7 @@ mod tests {
     fn request_serializes_correctly() {
         let req = ApiChatRequest {
             model: "llama-3.3-70b".to_string(),
+            thinking: None,
             messages: vec![
                 Message {
                     role: "system".to_string(),
@@ -4076,6 +4192,7 @@ mod tests {
 
         let req = ApiChatRequest {
             model: "test-model".to_string(),
+            thinking: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("What is the weather?".to_string()),
@@ -4100,6 +4217,7 @@ mod tests {
         let model_provider = make_model_provider("zai", "https://api.z.ai/api/paas/v4", None);
         let req = ApiChatRequest {
             model: "glm-5".to_string(),
+            thinking: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
@@ -4135,6 +4253,7 @@ mod tests {
         let model_provider = make_model_provider("test", "https://api.example.com/v1", None);
         let req = ApiChatRequest {
             model: "test-model".to_string(),
+            thinking: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
