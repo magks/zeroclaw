@@ -94,8 +94,15 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let targets = doctor_model_targets(config, None);
     let mut out = Vec::new();
 
-    for provider_name in &targets {
-        let result = match zeroclaw_providers::create_model_provider(provider_name, None) {
+    for (family, alias) in &targets {
+        let display = format!("{family}.{alias}");
+        let result = match zeroclaw_providers::create_model_provider_for_alias(
+            config,
+            family,
+            alias,
+            None,
+            &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        ) {
             Ok(handle) => handle.list_models().await,
             Err(e) => Err(e),
         };
@@ -103,7 +110,7 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
             Ok(models) => out.push(DiagResult {
                 severity: Severity::Ok,
                 category: "providers.models".to_string(),
-                message: format!("{}: {} models", provider_name, models.len()),
+                message: format!("{}: {} models", display, models.len()),
             }),
             Err(e) => {
                 let text = format_error_chain(&e);
@@ -115,7 +122,7 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
                 out.push(DiagResult {
                     severity,
                     category: "providers.models".to_string(),
-                    message: format!("{}: {}", provider_name, truncate_for_display(&text, 120)),
+                    message: format!("{}: {}", display, truncate_for_display(&text, 120)),
                 });
             }
         }
@@ -214,16 +221,32 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     ModelProbeOutcome::Error
 }
 
-fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
+/// Targets to probe — each entry is the typed `(family, alias)` pair used
+/// to look up the per-alias config block. Doctor formats `"family.alias"`
+/// at display time but must dispatch via the typed pair so
+/// `create_model_provider_for_alias` finds the family slot. Returning a
+/// joined `"family.alias"` string here (the pre-V3 shape) caused every
+/// block to report `Unknown model_provider family` because the factory
+/// match arm sees the whole dotted name as the family.
+///
+/// Override form: a bare `"<family>"` falls back to `alias = "default"`;
+/// a dotted `"<family>.<alias>"` parses both halves.
+fn doctor_model_targets(
+    config: &Config,
+    provider_override: Option<&str>,
+) -> Vec<(String, String)> {
     if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
-        return vec![model_provider.to_string()];
+        return match model_provider.split_once('.') {
+            Some((family, alias)) => vec![(family.to_string(), alias.to_string())],
+            None => vec![(model_provider.to_string(), "default".to_string())],
+        };
     }
 
     config
         .providers
         .models
         .iter_entries()
-        .map(|(type_k, alias_k, _)| format!("{type_k}.{alias_k}"))
+        .map(|(type_k, alias_k, _)| (type_k.to_string(), alias_k.to_string()))
         .collect()
 }
 
@@ -250,10 +273,17 @@ pub async fn run_models(
     let mut error_count = 0usize;
     let mut matrix_rows: Vec<(String, ModelProbeOutcome, Option<usize>, String)> = Vec::new();
 
-    for provider_name in &targets {
-        println!("  [{}]", provider_name);
+    for (family, alias) in &targets {
+        let display = format!("{family}.{alias}");
+        println!("  [{}]", display);
 
-        let outcome = match zeroclaw_providers::create_model_provider(provider_name, None) {
+        let outcome = match zeroclaw_providers::create_model_provider_for_alias(
+            config,
+            family,
+            alias,
+            None,
+            &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        ) {
             Ok(handle) => handle.list_models().await,
             Err(e) => Err(e),
         };
@@ -263,7 +293,7 @@ pub async fn run_models(
                 ok_count += 1;
                 println!("    ✅ {} models", models.len());
                 matrix_rows.push((
-                    provider_name.clone(),
+                    display.clone(),
                     ModelProbeOutcome::Ok,
                     Some(models.len()),
                     "catalog fetched".to_string(),
@@ -276,7 +306,7 @@ pub async fn run_models(
                         skipped_count += 1;
                         println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
                         matrix_rows.push((
-                            provider_name.clone(),
+                            display.clone(),
                             ModelProbeOutcome::Skipped,
                             None,
                             truncate_for_display(&error_text, 120),
@@ -289,7 +319,7 @@ pub async fn run_models(
                             truncate_for_display(&error_text, 160)
                         );
                         matrix_rows.push((
-                            provider_name.clone(),
+                            display.clone(),
                             ModelProbeOutcome::AuthOrAccess,
                             None,
                             truncate_for_display(&error_text, 120),
@@ -299,7 +329,7 @@ pub async fn run_models(
                         error_count += 1;
                         println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
                         matrix_rows.push((
-                            provider_name.clone(),
+                            display.clone(),
                             ModelProbeOutcome::Error,
                             None,
                             truncate_for_display(&error_text, 120),
