@@ -1445,8 +1445,23 @@ pub fn create_resilient_model_provider_for_alias_with_fallback(
                 fb_family, fb_alias,
             ))
         })?;
-        let fb_provider =
-            create_model_provider_inner(Some(config), fb_family, fb_alias, None, None, options)?;
+        // Thread the fallback alias's own api_key + uri override into the
+        // factory. Passing None lets `create_model_provider_inner` resolve
+        // credentials via env-var lookup, NOT the typed config's `base.api_key`
+        // field — so a fallback alias with its own api_key would fail
+        // authentication. Live validation caught this: bogus URI override on
+        // primary correctly routed fallbacks to the family endpoint, but they
+        // got 401 because their per-alias api_key wasn't applied.
+        let fb_api_key = fb_entry.api_key.as_deref();
+        let fb_api_url = fb_entry.uri.as_deref();
+        let fb_provider = create_model_provider_inner(
+            Some(config),
+            fb_family,
+            fb_alias,
+            fb_api_key,
+            fb_api_url,
+            options,
+        )?;
         providers.push((fb_family.to_string(), fb_provider));
         chain_models.push(Some(fb_model));
     }
