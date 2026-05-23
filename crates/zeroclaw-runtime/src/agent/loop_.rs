@@ -1738,6 +1738,13 @@ pub async fn run_tool_call_loop(
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
+                    // Patch ② attribution fields stay None until the
+                    // scope_provider_fallback wrap lands (follow-up commit);
+                    // the agent loop here doesn't yet capture the served
+                    // provider from PROVIDER_FALLBACK. With this scaffolding
+                    // in place the wrap is a localized change.
+                    actual_provider: None,
+                    actual_model: None,
                 });
 
                 // Record cost via task-local tracker (no-op when not scoped)
@@ -1894,6 +1901,8 @@ pub async fn run_tool_call_loop(
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    actual_provider: None,
+                    actual_model: None,
                 });
                 ::zeroclaw_log::record!(
                     WARN,

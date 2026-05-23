@@ -872,6 +872,8 @@ impl DelegateTool {
                         error_message: None,
                         input_tokens,
                         output_tokens,
+                        actual_provider: None,
+                        actual_model: None,
                     });
                 }
 

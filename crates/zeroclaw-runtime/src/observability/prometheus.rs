@@ -616,6 +616,8 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            actual_provider: None,
+            actual_model: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -625,6 +627,8 @@ mod tests {
             error_message: None,
             input_tokens: Some(200),
             output_tokens: Some(80),
+            actual_provider: None,
+            actual_model: None,
         });
 
         let output = obs.encode();
@@ -651,6 +655,8 @@ mod tests {
             error_message: Some("timeout".into()),
             input_tokens: None,
             output_tokens: None,
+            actual_provider: None,
+            actual_model: None,
         });
 
         let output = obs.encode();

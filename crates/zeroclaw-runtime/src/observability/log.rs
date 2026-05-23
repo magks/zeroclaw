@@ -121,9 +121,17 @@ impl Observer for LogObserver {
                 error_message,
                 input_tokens,
                 output_tokens,
+                actual_provider,
+                actual_model,
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "success": success, "error": error_message, "input_tokens": input_tokens, "output_tokens": output_tokens})), "llm.response");
+                // `actual_provider`/`actual_model` are set by the emission
+                // site (loop_.rs / delegate.rs) via `take_last_provider_fallback()`
+                // when a fallback chain (patch ④) actually fired. They flow
+                // into JSONL attributes alongside the configured values so
+                // zc-delegate-stats can render the "fallback-served-from"
+                // attribution. `None` (configured = served) serializes as null.
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "success": success, "error": error_message, "input_tokens": input_tokens, "output_tokens": output_tokens, "actual_provider": actual_provider, "actual_model": actual_model})), "llm.response");
             }
             ObserverEvent::DeploymentStarted { deploy_id } => {
                 ::zeroclaw_log::record!(
@@ -264,6 +272,8 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            actual_provider: None,
+            actual_model: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -273,6 +283,8 @@ mod tests {
             error_message: Some("rate limited".into()),
             input_tokens: None,
             output_tokens: None,
+            actual_provider: None,
+            actual_model: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),

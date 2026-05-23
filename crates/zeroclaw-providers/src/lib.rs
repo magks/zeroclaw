@@ -1340,6 +1340,153 @@ pub fn create_resilient_model_provider_from_ref(
     }
 }
 
+/// Like `create_resilient_model_provider_for_alias` but also installs an
+/// agent-level model-fallback chain (RFC #5890). When `fallback_refs` is
+/// non-empty, each dotted ref's `<family>.<alias>` is resolved to its
+/// configured model string in `config.providers.models.<family>.<alias>.model`
+/// and threaded into the `ReliableModelProvider`'s `model_fallbacks` map.
+/// After the primary model exhausts retries, the wrapper tries each fallback
+/// model in order against the same provider.
+///
+/// v1 supports only same-family fallback (all entries must share `family`
+/// with the primary). Cross-family fallback (e.g. zai → anthropic) is rejected
+/// with an error here; supporting it requires also adding the other family's
+/// provider to the `model_providers` Vec, which is a follow-up. Most use cases
+/// covered by RFC #5890 (e.g. orchestrator: zai.glm-5.1 → zai.glm-5-turbo →
+/// zai.glm-4.7) are same-family and so satisfied by this v1.
+pub fn create_resilient_model_provider_for_alias_with_fallback(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    fallback_refs: &[String],
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    if fallback_refs.is_empty() {
+        return create_resilient_model_provider_for_alias(
+            config,
+            family,
+            alias,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        );
+    }
+    let primary_provider =
+        create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
+    let primary_entry = config.providers.models.find(family, alias).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "primary alias {}.{} has no [providers.models.{}.{}] block",
+            family, alias, family, alias,
+        ))
+    })?;
+    let primary_model = primary_entry.model.clone().ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "primary alias {}.{} has no `model` field set",
+            family, alias,
+        ))
+    })?;
+
+    let mut fallback_models: Vec<String> = Vec::with_capacity(fallback_refs.len());
+    for fb_ref in fallback_refs {
+        let (fb_family, fb_alias) = fb_ref.split_once('.').ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "fallback ref `{}` must be dotted (`<family>.<alias>`); bare names \
+                 (e.g. `\"zai\"`) aren't supported because they lack the typed alias \
+                 context needed to resolve the fallback model string",
+                fb_ref,
+            ))
+        })?;
+        if fb_family != family {
+            anyhow::bail!(
+                "cross-family fallback not supported in v1 (primary={}.{}  fallback={}.{}); \
+                 RFC #5890 same-family-only at this revision — cross-family is a follow-up",
+                family,
+                alias,
+                fb_family,
+                fb_alias,
+            );
+        }
+        let fb_entry = config
+            .providers
+            .models
+            .find(fb_family, fb_alias)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "fallback alias {}.{} has no [providers.models.{}.{}] block",
+                    fb_family, fb_alias, fb_family, fb_alias,
+                ))
+            })?;
+        let fb_model = fb_entry.model.clone().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "fallback alias {}.{} has no `model` field set",
+                fb_family, fb_alias,
+            ))
+        })?;
+        fallback_models.push(fb_model);
+    }
+
+    let mut fallbacks_map = std::collections::HashMap::new();
+    fallbacks_map.insert(primary_model, fallback_models);
+
+    let reliable = ReliableModelProvider::new(
+        alias,
+        vec![(family.to_string(), primary_provider)],
+        reliability.provider_retries,
+        reliability.provider_backoff_ms,
+    )
+    .with_api_keys(reliability.api_keys.clone())
+    .with_model_fallbacks(fallbacks_map);
+
+    Ok(Box::new(reliable))
+}
+
+/// Dispatcher for fallback-aware resilient builder. Dotted refs go through
+/// `_for_alias_with_fallback`; bare names (no typed alias context) cannot
+/// resolve fallback model strings, so they fall back to the legacy builder
+/// (and any non-empty fallback chain is rejected).
+pub fn create_resilient_model_provider_from_ref_with_fallback(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+    fallback_refs: &[String],
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    if fallback_refs.is_empty() {
+        return create_resilient_model_provider_from_ref(
+            config,
+            name,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        );
+    }
+    match name.split_once('.') {
+        Some((family, alias)) => create_resilient_model_provider_for_alias_with_fallback(
+            config,
+            family,
+            alias,
+            fallback_refs,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        ),
+        None => anyhow::bail!(
+            "model_provider_fallback configured on agent with bare primary `{}` — \
+             fallback chains require a dotted primary (e.g. `\"<family>.<alias>\"`) so the \
+             builder can resolve each fallback alias's model string",
+            name
+        ),
+    }
+}
+
 /// Build a router fronted by `primary_name` plus one provider per unique
 /// `model_routes` entry. Each dotted `<family>.<alias>` name resolves
 /// through the typed `[model_providers.<family>.<alias>]` config (endpoint

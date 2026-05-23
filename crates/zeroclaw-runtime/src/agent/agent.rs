@@ -849,17 +849,36 @@ impl Agent {
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(config);
 
+        // Patch ④: per-agent fallback chain (RFC #5890). When the agent
+        // declares `model_provider_fallback`, route through the fallback-aware
+        // builder which installs a `model_fallbacks` chain into the
+        // `ReliableModelProvider`. This bypasses `model_routes`-based routing
+        // — the two features are orthogonal (routes = task-hint routing,
+        // fallback = failure-failover). If both are configured the fallback
+        // path wins; in practice an agent typically uses one or the other.
         let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                config,
-                provider_name,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+            if !agent_cfg.model_provider_fallback.is_empty() {
+                zeroclaw_providers::create_resilient_model_provider_from_ref_with_fallback(
+                    config,
+                    provider_name,
+                    &agent_cfg.model_provider_fallback,
+                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                    &config.reliability,
+                    &provider_runtime_options,
+                )?
+            } else {
+                zeroclaw_providers::create_routed_model_provider_with_options(
+                    config,
+                    provider_name,
+                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                    &config.reliability,
+                    &config.model_routes,
+                    &model_name,
+                    &provider_runtime_options,
+                )?
+            };
 
         let dispatcher_choice = agent_cfg.tool_dispatcher.as_str();
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {

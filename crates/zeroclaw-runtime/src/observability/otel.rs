@@ -215,6 +215,11 @@ impl Observer for OtelObserver {
                 error_message: _,
                 input_tokens: _,
                 output_tokens: _,
+                // Patch ② fields — otel currently doesn't surface fallback
+                // attribution as separate dimensions; can be added later if
+                // operators want a `served_vs_configured` panel.
+                actual_provider: _,
+                actual_model: _,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -454,6 +459,8 @@ mod tests {
             duration: Duration::from_millis(250),
             success: true,
             error_message: None,
+            actual_provider: None,
+            actual_model: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
         });
@@ -537,6 +544,8 @@ mod tests {
             error_message: Some("404 Not Found".into()),
             input_tokens: None,
             output_tokens: None,
+            actual_provider: None,
+            actual_model: None,
         });
     }
 
@@ -594,6 +603,8 @@ mod tests {
             error_message: None,
             input_tokens: Some(10),
             output_tokens: Some(5),
+            actual_provider: None,
+            actual_model: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
