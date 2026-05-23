@@ -633,9 +633,15 @@ impl Agent {
         initialize_mcp: bool,
         approval_backchannel: bool,
     ) -> Result<Self> {
+        eprintln!("[PATCH-4-DIAG-ENTRY] from_config_approval_mode agent={agent_alias}");
         let agent_cfg = config
             .agent(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+        eprintln!(
+            "[PATCH-4-DIAG-CFG] agent={agent_alias} fallback_len={} fallbacks={:?}",
+            agent_cfg.model_provider_fallback.len(),
+            agent_cfg.model_provider_fallback
+        );
         let risk_profile = config
             .risk_profile_for_agent(agent_alias)
             .with_context(|| {
