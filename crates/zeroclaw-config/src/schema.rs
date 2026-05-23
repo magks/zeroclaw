@@ -2736,6 +2736,16 @@ pub struct AliasedAgentConfig {
     /// `Config::validate()` fails loud on dangling references.
     #[serde(default)]
     pub model_provider: crate::providers::ModelProviderRef,
+    /// Ordered fallback chain of model-provider alias strings (dotted form,
+    /// e.g. `"zai.alt_turbo"`) tried when the primary (`model_provider`)
+    /// hits a retryable error after retries are exhausted. Resolved through
+    /// `model_providers.<type>.<alias>` at runtime by the resilient builder.
+    /// Empty (default) = retry-only with no failover (matches stock v0.8
+    /// behaviour where provider fallback was eradicated). RFC #5890 design
+    /// re-introduced on the fork as `Vec<String>` per the RFC's spec — see
+    /// the patch ④ commit message for context.
+    #[serde(default)]
+    pub model_provider_fallback: Vec<String>,
     /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
     #[serde(default)]
     pub risk_profile: String,
@@ -2901,6 +2911,7 @@ impl Default for AliasedAgentConfig {
             enabled: true,
             channels: Vec::new(),
             model_provider: crate::providers::ModelProviderRef::default(),
+            model_provider_fallback: Vec::new(),
             risk_profile: String::new(),
             runtime_profile: String::new(),
             skill_bundles: Vec::new(),

@@ -404,9 +404,16 @@ impl ReliableModelProvider {
         self
     }
 
-    /// Test-only hook: install per-model failover chains. Production builds
-    /// never call this — the schema has no surface for it.
-    #[cfg(test)]
+    /// Install per-model failover chains. Each map entry is
+    /// `primary_model → [fallback1, fallback2, ...]`; when a `chat()` call
+    /// for `primary_model` exhausts retries on every provider in
+    /// `self.model_providers`, the wrapper retries the chain with
+    /// `fallback1`, then `fallback2`, etc. — see `chat()` for the nested
+    /// loop. Used by the per-agent fallback chain (RFC #5890): the agent
+    /// loop's resilient-builder threads each entry of `AliasedAgentConfig::
+    /// model_provider_fallback` (model strings only) into this map.
+    /// Cross-family fallback (e.g. zai → anthropic) requires extra entries
+    /// in `model_providers` too.
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
         self
