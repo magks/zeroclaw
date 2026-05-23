@@ -1375,6 +1375,18 @@ pub fn create_resilient_model_provider_for_alias_with_fallback(
             options,
         );
     }
+    // Gap A: per-alias provider construction. Each entry in the fallback chain
+    // gets its OWN ModelProvider instance built from its own typed config — so
+    // overrides on `base.uri`, `base.api_key`, etc. on each fallback alias are
+    // honoured. The v1 model_fallbacks HashMap path (single primary provider,
+    // model strings only) only swapped the model string per attempt, which
+    // meant URI overrides leaked from the primary to every fallback. Test 3
+    // exposed this concretely: setting primary.uri = http://127.0.0.1:9 caused
+    // the alt_turbo and alt_47 fallbacks to also hit 127.0.0.1:9.
+    let mut providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
+    let mut chain_models: Vec<Option<String>> = Vec::new();
+
+    // Primary alias
     let primary_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
     let primary_entry = config.providers.models.find(family, alias).ok_or_else(|| {
@@ -1389,8 +1401,13 @@ pub fn create_resilient_model_provider_for_alias_with_fallback(
             family, alias,
         ))
     })?;
+    providers.push((family.to_string(), primary_provider));
+    chain_models.push(Some(primary_model));
 
-    let mut fallback_models: Vec<String> = Vec::with_capacity(fallback_refs.len());
+    // Fallback aliases — each gets its own provider+model from its typed
+    // config block. api_key=None and api_url=None so the per-alias typed
+    // config's own fields drive credentials/endpoint (otherwise this would
+    // inherit the primary's again and Gap A wouldn't be fixed).
     for fb_ref in fallback_refs {
         let (fb_family, fb_alias) = fb_ref.split_once('.').ok_or_else(|| {
             anyhow::Error::msg(format!(
@@ -1403,7 +1420,9 @@ pub fn create_resilient_model_provider_for_alias_with_fallback(
         if fb_family != family {
             anyhow::bail!(
                 "cross-family fallback not supported in v1 (primary={}.{}  fallback={}.{}); \
-                 RFC #5890 same-family-only at this revision — cross-family is a follow-up",
+                 RFC #5890 same-family-only at this revision — cross-family is a follow-up \
+                 (each family's request/response schema would need translating; Gap A's \
+                 per-alias construction is a prerequisite but not sufficient on its own)",
                 family,
                 alias,
                 fb_family,
@@ -1426,20 +1445,20 @@ pub fn create_resilient_model_provider_for_alias_with_fallback(
                 fb_family, fb_alias,
             ))
         })?;
-        fallback_models.push(fb_model);
+        let fb_provider =
+            create_model_provider_inner(Some(config), fb_family, fb_alias, None, None, options)?;
+        providers.push((fb_family.to_string(), fb_provider));
+        chain_models.push(Some(fb_model));
     }
-
-    let mut fallbacks_map = std::collections::HashMap::new();
-    fallbacks_map.insert(primary_model, fallback_models);
 
     let reliable = ReliableModelProvider::new(
         alias,
-        vec![(family.to_string(), primary_provider)],
+        providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(fallbacks_map);
+    .with_provider_models(chain_models);
 
     Ok(Box::new(reliable))
 }

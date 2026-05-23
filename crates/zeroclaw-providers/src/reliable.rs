@@ -377,8 +377,20 @@ pub struct ReliableModelProvider {
     /// Extra API keys for rotation (index tracks round-robin position).
     api_keys: Vec<String>,
     key_index: AtomicUsize,
-    /// Per-model failover chains. Test-only: model_name → [alt1, alt2, ...].
+    /// Per-model failover chains. Used by patch ④ in production via
+    /// `with_model_fallbacks`: model_name → [alt1, alt2, ...].
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Per-provider model overrides (parallel to `model_providers`). When
+    /// set (via `with_provider_models`), chat() uses `provider_models[i]`
+    /// as the model arg for `model_providers[i]` instead of the
+    /// caller-supplied model. This is how patch ④'s endpoint-level
+    /// failover gets each fallback alias to use ITS OWN typed config
+    /// (uri, api_key, model) rather than sharing the primary's
+    /// construction. Empty Vec = no overrides (legacy single-provider
+    /// behaviour). Mutually exclusive with `model_fallbacks` — the
+    /// patch ④ builder chooses one path based on whether the fallback
+    /// chain needs per-alias provider construction.
+    provider_models: Vec<Option<String>>,
 }
 
 impl ReliableModelProvider {
@@ -396,7 +408,36 @@ impl ReliableModelProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            provider_models: Vec::new(),
         }
+    }
+
+    /// Install per-provider model overrides. Parallel Vec to
+    /// `model_providers`: `provider_models[i]` is the model string that
+    /// `chat()` will pass to `model_providers[i].chat(...)`. `None` entries
+    /// fall back to the caller-supplied model. Used by patch ④'s
+    /// endpoint-level failover (each fallback alias gets its own
+    /// provider+model pair, so URI/key overrides on each alias's typed
+    /// config are respected).
+    ///
+    /// Length must match `model_providers.len()` — the builder guards
+    /// against mismatches by truncating or padding with `None`.
+    pub fn with_provider_models(mut self, models: Vec<Option<String>>) -> Self {
+        // Pad with None if caller passed fewer than model_providers.len();
+        // truncate if more. This keeps the invariant that
+        // `provider_models[i]` is always indexable when
+        // `model_providers[i]` is.
+        let target = self.model_providers.len();
+        if models.len() < target {
+            let mut padded = models;
+            padded.resize(target, None);
+            self.provider_models = padded;
+        } else {
+            let mut trimmed = models;
+            trimmed.truncate(target);
+            self.provider_models = trimmed;
+        }
+        self
     }
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
@@ -420,12 +461,32 @@ impl ReliableModelProvider {
     }
 
     /// Build the list of models to try: [original, alt1, alt2, ...]
+    ///
+    /// When `provider_models` is set (Gap A endpoint-level failover path),
+    /// the chain is just `[model]` — each provider in `model_providers`
+    /// carries its own override model and the outer model-loop in `chat()`
+    /// becomes single-iteration. Mixing per-provider models with
+    /// model_fallbacks would compound iterations (N providers × M models)
+    /// and try each combination, so the patch ④ builder picks one path.
     fn model_chain<'a>(&'a self, model: &'a str) -> Vec<&'a str> {
+        if !self.provider_models.is_empty() {
+            return vec![model];
+        }
         let mut chain = vec![model];
         if let Some(fallbacks) = self.model_fallbacks.get(model) {
             chain.extend(fallbacks.iter().map(|s| s.as_str()));
         }
         chain
+    }
+
+    /// Pick the model to pass to `model_providers[i].chat(...)`. When
+    /// `provider_models[i]` is set, use that; else use the chain's current
+    /// model. Returns a `&str` borrow valid for the loop body.
+    fn effective_model_for<'a>(&'a self, i: usize, current_model: &'a str) -> &'a str {
+        self.provider_models
+            .get(i)
+            .and_then(|o| o.as_deref())
+            .unwrap_or(current_model)
     }
 
     /// Advance to the next API key and return it, or None if no extra keys configured.
@@ -860,9 +921,21 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = Vec::new();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
+        // Patch ② follow-up: track the LAST provider/model attempted so we can
+        // record post-mortem attribution when the entire chain bails. Without
+        // this, the emission-site `take_last_provider_fallback()` returns None
+        // on failure and the trace can't tell you which fallback was last
+        // tried before everything failed.
+        let mut last_attempted_provider: Option<String> = None;
+        let mut last_attempted_model: Option<String> = None;
 
         for current_model in &models {
-            for (provider_name, model_provider) in &self.model_providers {
+            for (i, (provider_name, model_provider)) in self.model_providers.iter().enumerate() {
+                // Gap A: when provider_models is set, each provider uses
+                // ITS OWN model (from the typed alias config), not the
+                // caller-supplied model. This keeps URI/key overrides on
+                // each fallback alias's typed config in effect.
+                let effective_model = self.effective_model_for(i, current_model);
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -870,15 +943,17 @@ impl ModelProvider for ReliableModelProvider {
                         messages: &effective_messages,
                         tools: request.tools,
                     };
-                    match model_provider.chat(req, current_model, temperature).await {
+                    last_attempted_provider = Some(provider_name.clone());
+                    last_attempted_model = Some(effective_model.to_string());
+                    match model_provider.chat(req, effective_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0
-                                || *current_model != model
+                                || effective_model != model
                                 || context_truncated
                                 || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": effective_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -888,7 +963,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    effective_model,
                                 );
                             }
                             return Ok(resp);
@@ -899,7 +974,7 @@ impl ModelProvider for ReliableModelProvider {
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
                                     context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": effective_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // Nothing to truncate (system prompt alone exceeds
@@ -909,7 +984,7 @@ impl ModelProvider for ReliableModelProvider {
                                 push_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    effective_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
@@ -932,7 +1007,7 @@ impl ModelProvider for ReliableModelProvider {
                             push_failure(
                                 &mut failures,
                                 provider_name,
-                                current_model,
+                                effective_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
@@ -949,13 +1024,13 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if non_retryable {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "error": error_detail})), "Non-retryable error, moving on");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": effective_model, "error": error_detail})), "Non-retryable error, moving on");
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt + 1, "backoff_ms": wait, "reason": failure_reason, "error": error_detail})), "ModelProvider call failed, retrying");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": effective_model, "attempt": attempt + 1, "backoff_ms": wait, "reason": failure_reason, "error": error_detail})), "ModelProvider call failed, retrying");
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
@@ -963,12 +1038,31 @@ impl ModelProvider for ReliableModelProvider {
                     }
                 }
 
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model})), "Exhausted retries, trying next model_provider/model");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": effective_model})), "Exhausted retries, trying next model_provider/model");
             }
 
             if *current_model != model {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"original_model": model, "fallback_model": *current_model})), "Model fallback exhausted all model_providers, trying next fallback model");
             }
+        }
+
+        // Patch ② follow-up: on full-chain bail, record what was LAST attempted
+        // (only if it differs from the configured primary). This lets the
+        // emission-site (loop_.rs / delegate.rs) attach `actual_model` /
+        // `actual_provider` to the failure LlmResponse so observability can
+        // tell "primary failed and nothing recovered" apart from "primary
+        // failed, chain advanced to X, X also failed".
+        let primary_name = self
+            .model_providers
+            .first()
+            .map(|(n, _)| n.as_str())
+            .unwrap_or("");
+        if let (Some(last_p), Some(last_m)) = (
+            last_attempted_provider.as_ref(),
+            last_attempted_model.as_ref(),
+        ) && !(last_p.as_str() == primary_name && last_m.as_str() == model)
+        {
+            record_provider_fallback(primary_name, model, last_p, last_m);
         }
 
         anyhow::bail!(
