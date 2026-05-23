@@ -832,11 +832,21 @@ impl DelegateTool {
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let inner_started_at = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            model_provider.chat(chat_request, &model, temperature),
-        )
-        .await;
+        // Patch ② emission-site wiring: `scope_provider_fallback` captures
+        // any in-call provider fallback (RFC #5890 / patch ④) so we can
+        // surface `actual_provider` / `actual_model` on the LlmResponse
+        // event below. Tuple-return pattern mirrors loop_.rs.
+        let (result, provider_fallback_info) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let r = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    model_provider.chat(chat_request, &model, temperature),
+                )
+                .await;
+                let fb = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (r, fb)
+            })
+            .await;
 
         let result = match result {
             Ok(inner) => inner,
@@ -872,8 +882,12 @@ impl DelegateTool {
                         error_message: None,
                         input_tokens,
                         output_tokens,
-                        actual_provider: None,
-                        actual_model: None,
+                        actual_provider: provider_fallback_info
+                            .as_ref()
+                            .map(|fb| fb.actual_provider.clone()),
+                        actual_model: provider_fallback_info
+                            .as_ref()
+                            .map(|fb| fb.actual_model.clone()),
                     });
                 }
 
