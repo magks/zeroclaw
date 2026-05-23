@@ -1667,7 +1667,19 @@ impl DelegateTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
+        // Forward this delegate's observer into the agentic sub-loop so the
+        // sub-agent's typed llm.request/llm.response/tool.* events flow into the
+        // trace (the legacy record! macro fires regardless, but the typed
+        // Observer path is what carries model_provider + tokens — and what the
+        // zc-delegate-stats reporter prefers). When `self.observer` is unset
+        // (unit-test constructors), fall back to NoopObserver, preserving the
+        // pre-port behaviour. Symmetric with the non-agentic path that emits
+        // an `LlmResponse` event via `self.observer` (patch ③).
         let noop_observer = NoopObserver;
+        let sub_observer: &dyn Observer = match &self.observer {
+            Some(o) => &**o,
+            None => &noop_observer,
+        };
 
         let agentic_timeout_secs = self
             .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
@@ -1689,7 +1701,7 @@ impl DelegateTool {
                 model_provider,
                 &mut history,
                 &sub_tools,
-                &noop_observer,
+                sub_observer,
                 provider_type,
                 model,
                 temperature,
