@@ -3204,13 +3204,28 @@ pub async fn run(
         //
         // This is the live CLI entry point (`zeroclaw agent ...` → `agent::run`
         // re-exports `loop_::run`); the dormant `agent.rs::Agent::from_config`
-        // path is reached by ACP/daemon callers and was already patched in
-        // commit fa0ee9d68.
+        // path is reached by ACP/daemon callers and was patched in fa0ee9d68.
+        //
+        // The fallback builder needs the *dotted* `<family>.<alias>` primary
+        // so it can resolve per-alias model strings via the typed config.
+        // `provider_name` here is just the family — recompose the dotted ref
+        // from `agent_provider_resolved` (which carries both halves).
+        let primary_dotted_for_fallback: Option<String> = agent_provider_resolved
+            .as_ref()
+            .map(|(ty, alias, _)| format!("{ty}.{alias}"));
         let mut model_provider: Box<dyn ModelProvider> =
             if !agent.model_provider_fallback.is_empty() {
+                let primary = primary_dotted_for_fallback.as_deref().ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "agents.{agent_alias}.model_provider_fallback is set but the agent's \
+                         primary could not be resolved to a `<family>.<alias>` dotted ref — \
+                         set `[agents.{agent_alias}].model_provider = \"<family>.<alias>\"` \
+                         and ensure `[providers.models.<family>.<alias>]` exists"
+                    ))
+                })?;
                 zeroclaw_providers::create_resilient_model_provider_from_ref_with_fallback(
                     &config,
-                    &provider_name,
+                    primary,
                     &agent.model_provider_fallback,
                     agent_model_provider.and_then(|e| e.api_key.as_deref()),
                     agent_model_provider.and_then(|e| e.uri.as_deref()),

@@ -633,15 +633,9 @@ impl Agent {
         initialize_mcp: bool,
         approval_backchannel: bool,
     ) -> Result<Self> {
-        eprintln!("[PATCH-4-DIAG-ENTRY] from_config_approval_mode agent={agent_alias}");
         let agent_cfg = config
             .agent(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
-        eprintln!(
-            "[PATCH-4-DIAG-CFG] agent={agent_alias} fallback_len={} fallbacks={:?}",
-            agent_cfg.model_provider_fallback.len(),
-            agent_cfg.model_provider_fallback
-        );
         let risk_profile = config
             .risk_profile_for_agent(agent_alias)
             .with_context(|| {
@@ -855,25 +849,18 @@ impl Agent {
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(config);
 
-        // Patch ④: per-agent fallback chain (RFC #5890). When the agent
-        // declares `model_provider_fallback`, route through the fallback-aware
-        // builder which installs a `model_fallbacks` chain into the
-        // `ReliableModelProvider`. This bypasses `model_routes`-based routing
-        // — the two features are orthogonal (routes = task-hint routing,
-        // fallback = failure-failover). If both are configured the fallback
-        // path wins; in practice an agent typically uses one or the other.
-        eprintln!(
-            "[PATCH-4-DIAG] agent={} primary={} fallbacks={:?} len={}",
-            agent_alias,
-            provider_name,
-            agent_cfg.model_provider_fallback,
-            agent_cfg.model_provider_fallback.len()
-        );
+        // Patch ④: per-agent fallback chain (RFC #5890). See the symmetric
+        // wiring at loop_.rs:run for the live CLI path. `provider_name` here
+        // is the bare family — the fallback builder needs a dotted
+        // `<family>.<alias>` so it can resolve each entry's model string via
+        // the typed config. Recompose from `_provider_alias` (which carries
+        // the alias half of the resolved tuple).
+        let primary_dotted_for_fallback = format!("{provider_name}.{_provider_alias}");
         let model_provider: Box<dyn ModelProvider> =
             if !agent_cfg.model_provider_fallback.is_empty() {
                 zeroclaw_providers::create_resilient_model_provider_from_ref_with_fallback(
                     config,
-                    provider_name,
+                    &primary_dotted_for_fallback,
                     &agent_cfg.model_provider_fallback,
                     agent_model_provider.and_then(|e| e.api_key.as_deref()),
                     agent_model_provider.and_then(|e| e.uri.as_deref()),
