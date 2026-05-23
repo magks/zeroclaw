@@ -231,10 +231,7 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
 ///
 /// Override form: a bare `"<family>"` falls back to `alias = "default"`;
 /// a dotted `"<family>.<alias>"` parses both halves.
-fn doctor_model_targets(
-    config: &Config,
-    provider_override: Option<&str>,
-) -> Vec<(String, String)> {
+fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<(String, String)> {
     if let Some(model_provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
         return match model_provider.split_once('.') {
             Some((family, alias)) => vec![(family.to_string(), alias.to_string())],
