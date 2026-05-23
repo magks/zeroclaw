@@ -856,16 +856,12 @@ impl Agent {
         // — the two features are orthogonal (routes = task-hint routing,
         // fallback = failure-failover). If both are configured the fallback
         // path wins; in practice an agent typically uses one or the other.
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({
-                    "agent_alias": agent_alias,
-                    "primary": provider_name,
-                    "fallbacks": agent_cfg.model_provider_fallback,
-                    "fallbacks_len": agent_cfg.model_provider_fallback.len(),
-                })),
-            "patch-4: model_provider construction path selection"
+        eprintln!(
+            "[PATCH-4-DIAG] agent={} primary={} fallbacks={:?} len={}",
+            agent_alias,
+            provider_name,
+            agent_cfg.model_provider_fallback,
+            agent_cfg.model_provider_fallback.len()
         );
         let model_provider: Box<dyn ModelProvider> =
             if !agent_cfg.model_provider_fallback.is_empty() {
