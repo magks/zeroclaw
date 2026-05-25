@@ -450,7 +450,9 @@ impl OpenAiCompatibleModelProvider {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
+                        .with_attrs(
+                            ::serde_json::json!({"error": super::format_error_chain(&error)})
+                        ),
                     "Failed to build proxied timeout client with custom headers: "
                 );
                 Client::new()
@@ -513,7 +515,9 @@ impl OpenAiCompatibleModelProvider {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
+                        .with_attrs(
+                            ::serde_json::json!({"error": super::format_error_chain(&error)})
+                        ),
                     "Failed to build proxied streaming client with custom headers: "
                 );
                 Client::new()
@@ -528,7 +532,7 @@ impl OpenAiCompatibleModelProvider {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
+                    .with_attrs(::serde_json::json!({"error": super::format_error_chain(&error)})),
                 "Failed to build proxied streaming client: "
             );
             Client::new()
@@ -1307,7 +1311,9 @@ fn sse_bytes_to_chunks(
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                let _ = tx
+                    .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                    .await;
                 return;
             }
         }
@@ -1369,7 +1375,9 @@ fn sse_bytes_to_chunks(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             }
@@ -1408,7 +1416,9 @@ fn sse_bytes_to_events_for_contract(
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                let _ = tx
+                    .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                    .await;
                 return;
             }
         }
@@ -1535,7 +1545,9 @@ fn sse_bytes_to_events_for_contract(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             }
@@ -2031,7 +2043,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                                 "model_provider": &self.name,
                                 "url": &url,
                                 "phase": "model_list_request",
-                                "error": format!("{}", e),
+                                "error": super::format_error_chain(&e),
                             })),
                         "compatible: model list request failed"
                     );
@@ -2052,7 +2064,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         .with_attrs(::serde_json::json!({
                             "model_provider": &self.name,
                             "phase": "model_list_parse",
-                            "error": format!("{}", e),
+                            "error": super::format_error_chain(&e),
                         })),
                     "compatible: model list returned invalid JSON"
                 );
@@ -2623,7 +2635,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -2761,7 +2775,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -2864,7 +2880,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
