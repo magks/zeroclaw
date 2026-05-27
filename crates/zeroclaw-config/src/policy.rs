@@ -2316,7 +2316,17 @@ impl SecurityPolicy {
             autonomy: risk_profile.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: effective_workspace_only,
-            allowed_commands: risk_profile.allowed_commands.clone(),
+            // Merge `extra_allowed_commands` onto `allowed_commands` so a
+            // persona can add commands (e.g. `gh`, `rg`) without re-listing
+            // the entire default. Order: defaults first, extras appended.
+            // The shell tool's lookup is contains-based; duplicates are
+            // harmless.
+            allowed_commands: risk_profile
+                .allowed_commands
+                .iter()
+                .chain(risk_profile.extra_allowed_commands.iter())
+                .cloned()
+                .collect(),
             forbidden_paths: risk_profile.forbidden_paths.clone(),
             allowed_roots: risk_profile
                 .allowed_roots

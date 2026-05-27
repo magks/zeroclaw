@@ -8826,8 +8826,19 @@ pub struct RiskProfileConfig {
     pub level: AutonomyLevel,
     /// Restrict filesystem access to workspace-relative paths. Default: `false`.
     pub workspace_only: bool,
-    /// Allowlist of executable names for shell execution.
+    /// Allowlist of executable names for shell execution. Setting this in
+    /// config REPLACES the framework default list; if you want to add ONE
+    /// command on top of the defaults without re-listing everything, use
+    /// `extra_allowed_commands` below.
     pub allowed_commands: Vec<String>,
+    /// Additional executable names appended to `allowed_commands` at policy
+    /// build time. Use this when a persona needs commands beyond the
+    /// framework defaults (e.g. `gh`, `rg`, `osgrep`) without re-listing
+    /// the entire default list. Merged in `SecurityPolicy::from_profiles`.
+    /// Backward-compatible: `#[serde(default)]` → empty Vec on existing
+    /// configs.
+    #[serde(default)]
+    pub extra_allowed_commands: Vec<String>,
     /// Explicit path denylist.
     pub forbidden_paths: Vec<String>,
     /// Require approval for medium-risk operations.
@@ -8865,6 +8876,7 @@ impl Default for RiskProfileConfig {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
             allowed_commands: crate::policy::default_allowed_commands(),
+            extra_allowed_commands: Vec::new(),
             forbidden_paths: crate::policy::default_forbidden_paths(),
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
