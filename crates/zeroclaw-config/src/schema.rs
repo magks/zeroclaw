@@ -3074,6 +3074,32 @@ impl Config {
         self.runtime_profiles.get(profile_alias)
     }
 
+    /// Resolve effective tool-iteration cap for an agent.
+    ///
+    /// Honors `runtime_profile.max_tool_iterations` as a non-zero override
+    /// over the per-agent `AliasedAgentConfig.max_tool_iterations`, matching
+    /// the RuntimeProfileConfig docblock semantics ("`0` inherits the
+    /// global default"). Without this, the CLI agent loop reads
+    /// `agent.max_tool_iterations` directly and the runtime_profile value
+    /// is silently inert.
+    #[must_use]
+    pub fn effective_max_tool_iterations(&self, agent_alias: &str) -> usize {
+        let agent_default = self
+            .agents
+            .get(agent_alias)
+            .map(|a| a.max_tool_iterations)
+            .unwrap_or(0);
+        let runtime_override = self
+            .runtime_profile_for_agent(agent_alias)
+            .map(|r| r.max_tool_iterations)
+            .unwrap_or(0);
+        if runtime_override > 0 {
+            runtime_override
+        } else {
+            agent_default
+        }
+    }
+
     /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
     /// its concrete `ModelProviderConfig` entry. Returns `None` when the
     /// agent doesn't exist, the reference is unparseable, or the
