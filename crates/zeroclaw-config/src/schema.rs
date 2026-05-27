@@ -3100,6 +3100,94 @@ impl Config {
         }
     }
 
+    /// Resolve effective `max_history_messages` for an agent. Honors
+    /// `runtime_profile.max_history_messages` (`Option<usize>`) when
+    /// `Some(_)`, falling back to the per-agent
+    /// `AliasedAgentConfig.max_history_messages`. Same shape as
+    /// [`Self::effective_max_tool_iterations`].
+    #[must_use]
+    pub fn effective_max_history_messages(&self, agent_alias: &str) -> usize {
+        let agent_default = self
+            .agents
+            .get(agent_alias)
+            .map(|a| a.max_history_messages)
+            .unwrap_or(0);
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|r| r.max_history_messages)
+            .unwrap_or(agent_default)
+    }
+
+    /// Resolve effective `max_context_tokens` for an agent.
+    #[must_use]
+    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
+        let agent_default = self
+            .agents
+            .get(agent_alias)
+            .map(|a| a.max_context_tokens)
+            .unwrap_or(0);
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|r| r.max_context_tokens)
+            .unwrap_or(agent_default)
+    }
+
+    /// Resolve effective `compact_context` for an agent.
+    #[must_use]
+    pub fn effective_compact_context(&self, agent_alias: &str) -> bool {
+        let agent_default = self
+            .agents
+            .get(agent_alias)
+            .map(|a| a.compact_context)
+            .unwrap_or(true);
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|r| r.compact_context)
+            .unwrap_or(agent_default)
+    }
+
+    /// Resolve effective `max_tool_result_chars` for an agent.
+    #[must_use]
+    pub fn effective_max_tool_result_chars(&self, agent_alias: &str) -> usize {
+        let agent_default = self
+            .agents
+            .get(agent_alias)
+            .map(|a| a.max_tool_result_chars)
+            .unwrap_or(0);
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|r| r.max_tool_result_chars)
+            .unwrap_or(agent_default)
+    }
+
+    /// Resolve effective `max_system_prompt_chars` for an agent.
+    #[must_use]
+    pub fn effective_max_system_prompt_chars(&self, agent_alias: &str) -> usize {
+        let agent_default = self
+            .agents
+            .get(agent_alias)
+            .map(|a| a.max_system_prompt_chars)
+            .unwrap_or(0);
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|r| r.max_system_prompt_chars)
+            .unwrap_or(agent_default)
+    }
+
+    /// Resolve effective `tool_call_dedup_exempt` set for an agent. Vec
+    /// fields are **additive** (not override) — the runtime_profile's
+    /// entries extend the per-agent list rather than replacing it.
+    /// Returns owned `Vec<String>`; callers passing `&` get a temporary
+    /// whose lifetime extends to the end of the enclosing statement
+    /// (sufficient for synchronous-or-awaited function calls).
+    #[must_use]
+    pub fn effective_tool_call_dedup_exempt(&self, agent_alias: &str) -> Vec<String> {
+        let mut out = self
+            .agents
+            .get(agent_alias)
+            .map(|a| a.tool_call_dedup_exempt.clone())
+            .unwrap_or_default();
+        if let Some(rp) = self.runtime_profile_for_agent(agent_alias) {
+            out.extend(rp.tool_call_dedup_exempt.iter().cloned());
+        }
+        out
+    }
+
     /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
     /// its concrete `ModelProviderConfig` entry. Returns `None` when the
     /// agent doesn't exist, the reference is unparseable, or the

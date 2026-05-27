@@ -3411,7 +3411,7 @@ pub async fn run(
         ));
         }
         retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
-        let bootstrap_max_chars = if agent.compact_context {
+        let bootstrap_max_chars = if config.effective_compact_context(agent_alias) {
             Some(6000)
         } else {
             None
@@ -3435,8 +3435,8 @@ pub async fn run(
                 Some(&risk_profile),
                 native_tools,
                 config.skills.prompt_injection_mode,
-                agent.compact_context,
-                agent.max_system_prompt_chars,
+                config.effective_compact_context(agent_alias),
+                config.effective_max_system_prompt_chars(agent_alias),
             );
 
         // Append structured tool-use instructions with schemas (only for non-native model_providers)
@@ -3570,7 +3570,7 @@ pub async fn run(
                 !interactive,
             )
             .await;
-            let rag_limit = if agent.compact_context { 2 } else { 5 };
+            let rag_limit = if config.effective_compact_context(agent_alias) { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
@@ -3627,13 +3627,13 @@ pub async fn run(
                             None,
                             None,
                             &excluded_tools,
-                            &agent.tool_call_dedup_exempt,
+                            &config.effective_tool_call_dedup_exempt(agent_alias),
                             activated_handle.as_ref(),
                             Some(model_switch_callback.clone()),
                             &config.pacing,
                             agent.strict_tool_parsing,
-                            agent.max_tool_result_chars,
-                            agent.max_context_tokens,
+                            config.effective_max_tool_result_chars(agent_alias),
+                            config.effective_max_context_tokens(agent_alias),
                             None, // shared_budget
                             None, // channel: CLI mode — uses prompt_cli
                             None, // receipt_generator
@@ -3929,7 +3929,7 @@ pub async fn run(
                     false,
                 )
                 .await;
-                let rag_limit = if agent.compact_context { 2 } else { 5 };
+                let rag_limit = if config.effective_compact_context(agent_alias) { 2 } else { 5 };
                 let hw_context = hardware_rag
                     .as_ref()
                     .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
@@ -4012,13 +4012,13 @@ pub async fn run(
                                 Some(delta_tx.clone()),
                                 None,
                                 &excluded_tools,
-                                &agent.tool_call_dedup_exempt,
+                                &config.effective_tool_call_dedup_exempt(agent_alias),
                                 activated_handle.as_ref(),
                                 Some(model_switch_callback.clone()),
                                 &config.pacing,
                                 agent.strict_tool_parsing,
-                                agent.max_tool_result_chars,
-                                agent.max_context_tokens,
+                                config.effective_max_tool_result_chars(agent_alias),
+                                config.effective_max_context_tokens(agent_alias),
                                 None, // shared_budget
                                 None, // channel: interactive CLI — uses prompt_cli
                                 None, // receipt_generator
@@ -4086,7 +4086,7 @@ pub async fn run(
                                 let mut compressor =
                                     crate::agent::context_compressor::ContextCompressor::new(
                                         agent.context_compression.clone(),
-                                        agent.max_context_tokens,
+                                        config.effective_max_context_tokens(agent_alias),
                                     )
                                     .with_memory(mem.clone());
                                 let error_msg = format!("{e}");
@@ -4156,7 +4156,7 @@ pub async fn run(
                 {
                     let compressor = crate::agent::context_compressor::ContextCompressor::new(
                         agent.context_compression.clone(),
-                        agent.max_context_tokens,
+                        config.effective_max_context_tokens(agent_alias),
                     )
                     .with_memory(mem.clone());
                     match compressor
@@ -4183,13 +4183,13 @@ pub async fn run(
                                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "Context compression failed, falling back to history trim"
                             );
-                            trim_history(&mut history, agent.max_history_messages / 2);
+                            trim_history(&mut history, config.effective_max_history_messages(agent_alias) / 2);
                         }
                     }
                 }
 
                 // Hard cap as a safety net.
-                trim_history(&mut history, agent.max_history_messages);
+                trim_history(&mut history, config.effective_max_history_messages(agent_alias));
 
                 // Restore base system prompt (remove per-turn thinking prefix).
                 if thinking_params.system_prompt_prefix.is_some()
@@ -4577,7 +4577,7 @@ pub async fn process_message(
             tools_registry.iter().map(|tool| tool.name()).collect();
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
-        let bootstrap_max_chars = if agent.compact_context {
+        let bootstrap_max_chars = if config.effective_compact_context(agent_alias) {
             Some(6000)
         } else {
             None
@@ -4601,8 +4601,8 @@ pub async fn process_message(
                 Some(&risk_profile),
                 native_tools,
                 config.skills.prompt_injection_mode,
-                agent.compact_context,
-                agent.max_system_prompt_chars,
+                config.effective_compact_context(agent_alias),
+                config.effective_max_system_prompt_chars(agent_alias),
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -4670,7 +4670,7 @@ pub async fn process_message(
             false,
         )
         .await;
-        let rag_limit = if agent.compact_context { 2 } else { 5 };
+        let rag_limit = if config.effective_compact_context(agent_alias) { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
@@ -4714,7 +4714,7 @@ pub async fn process_message(
             config.effective_max_tool_iterations(agent_alias),
             Some(&approval_manager),
             &excluded_tools,
-            &agent.tool_call_dedup_exempt,
+            &config.effective_tool_call_dedup_exempt(agent_alias),
             activated_handle_pm.as_ref(),
             None,
             agent.strict_tool_parsing,
