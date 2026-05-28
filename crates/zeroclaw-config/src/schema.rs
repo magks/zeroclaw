@@ -13918,6 +13918,46 @@ impl Config {
             }
         }
 
+        // Persona bundles — each configured directory must exist and be a
+        // directory, and no two bundles may resolve to the same directory.
+        // Unlike skill bundles there is NO `<install>/shared/` containment
+        // rule: persona bundles are trusted, location-free authored content
+        // (see [`crate::persona_bundles`]). Nothing auto-creates the
+        // directory (a persona bundle ships its own markdown), so a missing
+        // path is almost always a typo and surfaces here.
+        if !self.persona_bundles.is_empty() {
+            let install_root = self.install_root_dir();
+            for alias in self.persona_bundles.keys() {
+                let dir = crate::persona_bundles::resolve_directory(self, &install_root, alias)
+                    .map_err(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "persona_bundle": alias,
+                                "error": format!("{}", e),
+                            })),
+                            "persona_bundles.<alias>.directory could not be resolved"
+                        );
+                        anyhow::Error::msg(e.to_string())
+                    })?;
+                if let Err(e) = crate::persona_bundles::validate_directory(&dir) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("persona-bundles.{alias}.directory"),
+                        "{e}"
+                    );
+                }
+            }
+            if let Err(e) = crate::persona_bundles::validate_uniqueness(self, &install_root) {
+                validation_bail!(InvalidFormat, "persona-bundles", "{e}");
+            }
+        }
+
         // Validate every configured risk profile. Each profile stands on
         // its own — there is no "active" or "default" risk profile concept;
         // an agent's `risk_profile` field names exactly which one applies.
