@@ -694,6 +694,11 @@ impl Agent {
             if session_cwd.is_some() {
                 policy.allowed_roots.push(agent_workspace.clone());
             }
+            // Persona-bundle equipment: the same merge the live CLI path gets
+            // via SecurityPolicy::for_agent. Applied explicitly here because
+            // the ACP path builds its policy through from_risk_profile (+
+            // session cwd), not for_agent — wiring both is the dual-path rule.
+            policy.merge_persona_bundle_equipment(config, agent_alias);
             policy
         });
 

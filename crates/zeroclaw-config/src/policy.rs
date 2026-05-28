@@ -2440,7 +2440,53 @@ impl SecurityPolicy {
             }
         }
 
+        // Persona-bundle equipment: append the extra_allowed_roots /
+        // extra_allowed_commands declared by the agent's persona_bundles. Same
+        // additive shape as the workspace.access merge above.
+        policy.merge_persona_bundle_equipment(config, agent_alias);
+
         Ok(policy)
+    }
+
+    /// Append the additive equipment declared by an agent's `persona_bundles`
+    /// — each bundle's `extra_allowed_roots` and `extra_allowed_commands` —
+    /// onto this policy. Roots are user-path-expanded and resolved against
+    /// `workspace_dir` exactly like `allowed_roots`; commands mirror the
+    /// `risk_profile.extra_allowed_commands` merge (defaults first, extras
+    /// appended — the shell tool's lookup is contains-based, so duplicates are
+    /// harmless). No-op for agents without persona_bundles. Reads from the
+    /// canonical `config.persona_bundles`; nothing is cached. Applied by both
+    /// the live CLI path (via [`Self::for_agent`]) and the ACP path (via the
+    /// `Agent::from_config*` constructor).
+    pub fn merge_persona_bundle_equipment(
+        &mut self,
+        config: &crate::schema::Config,
+        agent_alias: &str,
+    ) {
+        let Some(agent) = config.agents.get(agent_alias) else {
+            return;
+        };
+        for bundle_alias in &agent.persona_bundles {
+            let bundle_alias = bundle_alias.trim();
+            if bundle_alias.is_empty() {
+                continue;
+            }
+            // Dangling refs are already surfaced by Config::validate.
+            let Some(bundle) = config.persona_bundles.get(bundle_alias) else {
+                continue;
+            };
+            for root in &bundle.extra_allowed_roots {
+                let expanded = expand_user_path(root);
+                let resolved = if expanded.is_absolute() {
+                    expanded
+                } else {
+                    self.workspace_dir.join(expanded)
+                };
+                self.allowed_roots.push(resolved);
+            }
+            self.allowed_commands
+                .extend(bundle.extra_allowed_commands.iter().cloned());
+        }
     }
 
     /// Render a human-readable summary of the active security constraints
@@ -2688,6 +2734,66 @@ mod tests {
             vec!["--net=none".to_string()],
             "firejail_args"
         );
+    }
+
+    #[test]
+    fn merge_persona_bundle_equipment_appends_roots_and_commands() {
+        use crate::schema::{AliasedAgentConfig, Config, PersonaBundleConfig, RiskProfileConfig};
+        use std::path::Path;
+
+        let mut config = Config::default();
+        config.persona_bundles.insert(
+            "rev".into(),
+            PersonaBundleConfig {
+                extra_allowed_roots: vec!["/home/u/dev/nbsg".into()],
+                extra_allowed_commands: vec!["gh".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "agent1".into(),
+            AliasedAgentConfig {
+                persona_bundles: vec!["rev".into()],
+                ..Default::default()
+            },
+        );
+
+        let mut policy =
+            SecurityPolicy::from_risk_profile(&RiskProfileConfig::default(), Path::new("/ws"));
+        let roots_before = policy.allowed_roots.len();
+        let cmds_before = policy.allowed_commands.len();
+        policy.merge_persona_bundle_equipment(&config, "agent1");
+
+        assert_eq!(policy.allowed_roots.len(), roots_before + 1);
+        assert!(
+            policy
+                .allowed_roots
+                .iter()
+                .any(|p| p == Path::new("/home/u/dev/nbsg")),
+            "absolute extra_allowed_roots must be appended verbatim"
+        );
+        assert_eq!(policy.allowed_commands.len(), cmds_before + 1);
+        assert!(policy.allowed_commands.iter().any(|c| c == "gh"));
+    }
+
+    #[test]
+    fn merge_persona_bundle_equipment_noop_without_bundles() {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+        use std::path::Path;
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("agent1".into(), AliasedAgentConfig::default());
+
+        let mut policy =
+            SecurityPolicy::from_risk_profile(&RiskProfileConfig::default(), Path::new("/ws"));
+        let roots_before = policy.allowed_roots.len();
+        let cmds_before = policy.allowed_commands.len();
+        policy.merge_persona_bundle_equipment(&config, "agent1");
+
+        assert_eq!(policy.allowed_roots.len(), roots_before);
+        assert_eq!(policy.allowed_commands.len(), cmds_before);
     }
 
     /// The Full-autonomy override on `workspace_only` is intentional
