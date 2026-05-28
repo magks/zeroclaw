@@ -1,4 +1,4 @@
-use crate::agent::personality;
+use crate::agent::personality::{self, ResolvedPersonaBundle};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -18,6 +18,11 @@ pub struct PromptContext<'a> {
     /// ACP sessions pass the agent's own dir here while letting `workspace_dir`
     /// follow the session cwd.
     pub agent_workspace_dir: &'a Path,
+    /// Persona bundles composed onto `agent_workspace_dir` at prompt-build
+    /// time (workspace wins, then bundles latest-first). Resolved from
+    /// `[agents.<X>].persona_bundles`; empty for agents without bundles. Keeps
+    /// the ACP path's overlay identical to the live CLI path.
+    pub persona_bundles: &'a [ResolvedPersonaBundle],
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
@@ -120,7 +125,10 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        let profile = personality::load_personality(ctx.agent_workspace_dir);
+        let profile = personality::load_personality_with_bundles(
+            ctx.persona_bundles,
+            ctx.agent_workspace_dir,
+        );
         prompt.push_str(&profile.render());
 
         Ok(prompt)
@@ -366,6 +374,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: &workspace,
             agent_workspace_dir: &workspace,
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -394,11 +403,89 @@ mod tests {
     }
 
     #[test]
+    fn acp_path_injects_persona_bundle_soul() {
+        // ACP-path half of the dual-path regression net (the live-path half
+        // lives in system_prompt.rs). An empty workspace + a bundle supplying
+        // SOUL.md must put the bundle's SOUL into IdentitySection's output.
+        let bundle_dir =
+            std::env::temp_dir().join(format!("zeroclaw_acp_bundle_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("SOUL.md"), "ACP_BUNDLE_SOUL_MARKER").unwrap();
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_acp_ws_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let bundles =
+            [ResolvedPersonaBundle::new(bundle_dir.clone(), "openclaw", vec![], vec![]).unwrap()];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            agent_workspace_dir: &workspace,
+            persona_bundles: &bundles,
+            model_name: "m",
+            tools: &[],
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::default(),
+        };
+        let output = IdentitySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("ACP_BUNDLE_SOUL_MARKER"),
+            "ACP path must inject the bundle's SOUL.md via IdentitySection"
+        );
+
+        let _ = std::fs::remove_dir_all(bundle_dir);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn acp_path_workspace_overrides_bundle() {
+        let bundle_dir =
+            std::env::temp_dir().join(format!("zeroclaw_acp_bundle_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("SOUL.md"), "ACP_BUNDLE_SOUL").unwrap();
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_acp_ws_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "ACP_WORKSPACE_SOUL").unwrap();
+
+        let bundles =
+            [ResolvedPersonaBundle::new(bundle_dir.clone(), "openclaw", vec![], vec![]).unwrap()];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            agent_workspace_dir: &workspace,
+            persona_bundles: &bundles,
+            model_name: "m",
+            tools: &[],
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::default(),
+        };
+        let output = IdentitySection.build(&ctx).unwrap();
+        assert!(output.contains("ACP_WORKSPACE_SOUL"));
+        assert!(
+            !output.contains("ACP_BUNDLE_SOUL"),
+            "workspace SOUL.md overrides the bundle's on the ACP path"
+        );
+
+        let _ = std::fs::remove_dir_all(bundle_dir);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn prompt_builder_assembles_sections() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -422,6 +509,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -445,6 +533,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -491,6 +580,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -535,6 +625,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
             agent_workspace_dir: Path::new("/tmp/workspace"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -565,6 +656,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -608,6 +700,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
             agent_workspace_dir: Path::new("/tmp/workspace"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -644,6 +737,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -681,6 +775,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -710,6 +805,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -747,6 +843,7 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
+            persona_bundles: &[],
             model_name: "test-model",
             tools: &tools,
             skills: &[],

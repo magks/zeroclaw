@@ -1556,6 +1556,9 @@ impl DelegateTool {
         let ctx = PromptContext {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
+            // This delegate operational prompt omits IdentitySection, so no
+            // personality/persona overlay applies here.
+            persona_bundles: &[],
             model_name,
             tools: prompt_tools,
             skills: &skills,
