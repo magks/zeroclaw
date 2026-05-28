@@ -3570,7 +3570,11 @@ pub async fn run(
                 !interactive,
             )
             .await;
-            let rag_limit = if config.effective_compact_context(agent_alias) { 2 } else { 5 };
+            let rag_limit = if config.effective_compact_context(agent_alias) {
+                2
+            } else {
+                5
+            };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
@@ -3929,7 +3933,11 @@ pub async fn run(
                     false,
                 )
                 .await;
-                let rag_limit = if config.effective_compact_context(agent_alias) { 2 } else { 5 };
+                let rag_limit = if config.effective_compact_context(agent_alias) {
+                    2
+                } else {
+                    5
+                };
                 let hw_context = hardware_rag
                     .as_ref()
                     .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
@@ -4183,13 +4191,19 @@ pub async fn run(
                                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "Context compression failed, falling back to history trim"
                             );
-                            trim_history(&mut history, config.effective_max_history_messages(agent_alias) / 2);
+                            trim_history(
+                                &mut history,
+                                config.effective_max_history_messages(agent_alias) / 2,
+                            );
                         }
                     }
                 }
 
                 // Hard cap as a safety net.
-                trim_history(&mut history, config.effective_max_history_messages(agent_alias));
+                trim_history(
+                    &mut history,
+                    config.effective_max_history_messages(agent_alias),
+                );
 
                 // Restore base system prompt (remove per-turn thinking prefix).
                 if thinking_params.system_prompt_prefix.is_some()
@@ -4670,7 +4684,11 @@ pub async fn process_message(
             false,
         )
         .await;
-        let rag_limit = if config.effective_compact_context(agent_alias) { 2 } else { 5 };
+        let rag_limit = if config.effective_compact_context(agent_alias) {
+            2
+        } else {
+            5
+        };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
