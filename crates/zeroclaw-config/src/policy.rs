@@ -2622,6 +2622,7 @@ mod tests {
             level: AutonomyLevel::ReadOnly,
             workspace_only: true,
             allowed_commands: vec!["only_this".into()],
+            extra_allowed_commands: vec!["extra_only".into()],
             forbidden_paths: vec!["/secret".into()],
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
@@ -2640,7 +2641,11 @@ mod tests {
 
         assert_eq!(policy.autonomy, AutonomyLevel::ReadOnly, "level → autonomy");
         assert!(policy.workspace_only, "workspace_only");
-        assert_eq!(policy.allowed_commands, vec!["only_this".to_string()]);
+        assert_eq!(
+            policy.allowed_commands,
+            vec!["only_this".to_string(), "extra_only".to_string()],
+            "extra_allowed_commands must be appended to allowed_commands"
+        );
         assert_eq!(policy.forbidden_paths, vec!["/secret".to_string()]);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
