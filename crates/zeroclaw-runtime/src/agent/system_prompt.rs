@@ -27,15 +27,23 @@ fn load_openclaw_bootstrap_files(
         inject_workspace_file(prompt, workspace_dir, bundles, filename, max_chars_per_file);
     }
 
-    // HEARTBEAT.md + BOOTSTRAP.md — injected only when some layer (workspace or
-    // a persona bundle) actually provides them (heartbeat ritual / first-run
-    // scaffold), so the common case where neither exists stays quiet rather
-    // than emitting a not-found marker. HEARTBEAT.md was previously skipped on
-    // this path entirely (it loaded only on the ACP path) — fixed here.
-    for optional in ["HEARTBEAT.md", "BOOTSTRAP.md"] {
-        if personality::resolve_overlaid_file(optional, bundles, workspace_dir).is_some() {
-            inject_workspace_file(prompt, workspace_dir, bundles, optional, max_chars_per_file);
-        }
+    // BOOTSTRAP.md — injected only when some layer (workspace or a persona
+    // bundle) provides it (first-run scaffold), so the common case stays quiet
+    // rather than emitting a not-found marker.
+    //
+    // HEARTBEAT.md is deliberately NOT loaded here. This function is shared
+    // with the channel orchestrator, which intentionally excludes HEARTBEAT.md
+    // (it makes LLMs emit spurious "HEARTBEAT_OK" acks in conversations). The
+    // ACP path loads it via personality::PERSONALITY_FILES; this openclaw
+    // bootstrap path never has and must not, even from a bundle.
+    if personality::resolve_overlaid_file("BOOTSTRAP.md", bundles, workspace_dir).is_some() {
+        inject_workspace_file(
+            prompt,
+            workspace_dir,
+            bundles,
+            "BOOTSTRAP.md",
+            max_chars_per_file,
+        );
     }
 
     // MEMORY.md — curated long-term memory (main session only)
@@ -422,8 +430,13 @@ fn inject_workspace_file(
             }
         }
         None => {
-            // No layer (workspace or any bundle) provides a non-empty file.
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            // No layer provides non-empty content. Preserve the historical
+            // behavior: a file present-but-empty in some layer is skipped
+            // silently (no header); only a file absent from every layer gets
+            // the not-found marker.
+            if !personality::file_present_in_any_layer(filename, bundles, workspace_dir) {
+                let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            }
         }
     }
 }
@@ -490,15 +503,32 @@ mod tests {
     }
 
     #[test]
-    fn live_path_injects_heartbeat_from_bundle() {
-        // Regression for the HEARTBEAT.md silent-skip: the live path never
-        // loaded HEARTBEAT.md before this change.
+    fn live_path_excludes_heartbeat_even_from_bundle() {
+        // HEARTBEAT.md is intentionally NOT loaded on the openclaw bootstrap
+        // path — it's shared with the channel orchestrator, where HEARTBEAT
+        // triggers spurious "HEARTBEAT_OK" acks. Even a bundle that ships
+        // HEARTBEAT.md must not surface it here; the ACP path (which loads
+        // PERSONALITY_FILES) is where HEARTBEAT belongs.
         let workspace = tempfile::tempdir().unwrap();
         let (_b, bundle) = bundle_with(&[("HEARTBEAT.md", "HEARTBEAT_MARKER")]);
         let prompt = live_prompt(workspace.path(), std::slice::from_ref(&bundle));
         assert!(
-            prompt.contains("HEARTBEAT_MARKER"),
-            "HEARTBEAT.md from a bundle must be injected on the live path"
+            !prompt.contains("HEARTBEAT_MARKER"),
+            "HEARTBEAT.md must not be injected on the openclaw bootstrap path"
+        );
+        assert!(!prompt.contains("### HEARTBEAT.md"));
+    }
+
+    #[test]
+    fn live_path_empty_workspace_file_skipped_without_bundles() {
+        // Backward-compat with the channel path: an empty workspace file is
+        // skipped silently (no header, no marker) when no bundle supplies it.
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("SOUL.md"), "   \n").unwrap();
+        let prompt = live_prompt(workspace.path(), &[]);
+        assert!(
+            !prompt.contains("### SOUL.md"),
+            "an empty workspace file must be skipped, not marked not-found"
         );
     }
 

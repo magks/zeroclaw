@@ -285,6 +285,25 @@ pub fn resolve_overlaid_file(
     None
 }
 
+/// Whether `filename` exists as a file in any overlay layer — the agent
+/// workspace or an admitting bundle — regardless of content. Mirrors
+/// [`resolve_overlaid_file`]'s layer set and include/exclude rules, but checks
+/// presence rather than non-empty content. The live prompt path uses it to
+/// distinguish "present but empty" (skip silently) from "absent everywhere"
+/// (emit a not-found marker), preserving the pre-overlay behavior.
+pub fn file_present_in_any_layer(
+    filename: &str,
+    bundles: &[ResolvedPersonaBundle],
+    workspace_dir: &Path,
+) -> bool {
+    if workspace_dir.join(filename).is_file() {
+        return true;
+    }
+    bundles
+        .iter()
+        .any(|b| b.admits(filename) && b.directory.join(filename).is_file())
+}
+
 /// Overlay-resolve `filename` and apply the [`MAX_FILE_CHARS`] cap, yielding a
 /// [`PersonalityFile`]. The ACP loader's per-file entry point.
 fn load_overlaid_file(
