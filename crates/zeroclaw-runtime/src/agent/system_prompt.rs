@@ -3,6 +3,7 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
+use crate::agent::personality::{self, ResolvedPersonaBundle};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -13,26 +14,38 @@ pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
+    bundles: &[ResolvedPersonaBundle],
     max_chars_per_file: usize,
 ) {
     prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
+        "The following files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
     let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
 
     for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+        inject_workspace_file(prompt, workspace_dir, bundles, filename, max_chars_per_file);
     }
 
-    // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
+    // HEARTBEAT.md + BOOTSTRAP.md — injected only when some layer (workspace or
+    // a persona bundle) actually provides them (heartbeat ritual / first-run
+    // scaffold), so the common case where neither exists stays quiet rather
+    // than emitting a not-found marker. HEARTBEAT.md was previously skipped on
+    // this path entirely (it loaded only on the ACP path) — fixed here.
+    for optional in ["HEARTBEAT.md", "BOOTSTRAP.md"] {
+        if personality::resolve_overlaid_file(optional, bundles, workspace_dir).is_some() {
+            inject_workspace_file(prompt, workspace_dir, bundles, optional, max_chars_per_file);
+        }
     }
 
     // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+    inject_workspace_file(
+        prompt,
+        workspace_dir,
+        bundles,
+        "MEMORY.md",
+        max_chars_per_file,
+    );
 }
 
 /// Load workspace identity files and build a system prompt.
@@ -99,6 +112,9 @@ pub fn build_system_prompt_with_mode(
         skills_prompt_mode,
         false,
         0,
+        // No persona bundles on this wrapper path — bundle-driven agents build
+        // their prompt through the loop_ live path which threads them in.
+        &[],
     )
 }
 
@@ -115,6 +131,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,
     max_system_prompt_chars: usize,
+    persona_bundles: &[ResolvedPersonaBundle],
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -269,7 +286,12 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
                     // Fall back to OpenClaw bootstrap files
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    load_openclaw_bootstrap_files(
+                        &mut prompt,
+                        workspace_dir,
+                        persona_bundles,
+                        max_chars,
+                    );
                 }
                 Err(e) => {
                     // Log error but don't fail - fall back to OpenClaw
@@ -277,18 +299,23 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
                     );
                     let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+                    load_openclaw_bootstrap_files(
+                        &mut prompt,
+                        workspace_dir,
+                        persona_bundles,
+                        max_chars,
+                    );
                 }
             }
         } else {
             // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, persona_bundles, max_chars);
         }
     } else {
         // No identity config - use OpenClaw format
         let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
+        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, persona_bundles, max_chars);
     }
 
     // ── 6. Date & Time ──────────────────────────────────────────
@@ -356,32 +383,32 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 }
 
-/// Inject a single workspace file into the prompt with truncation and missing-file markers.
+/// Inject a single personality file into the prompt with truncation and
+/// missing-file markers, sourcing its content through the persona-bundle
+/// overlay (workspace wins, then bundles) via
+/// [`personality::resolve_overlaid_file`]. With an empty `bundles` slice this
+/// behaves like the previous workspace-only read.
 fn inject_workspace_file(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
+    bundles: &[ResolvedPersonaBundle],
     filename: &str,
     max_chars: usize,
 ) {
     use std::fmt::Write;
 
-    let path = workspace_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return;
-            }
+    match personality::resolve_overlaid_file(filename, bundles, workspace_dir) {
+        Some((_path, trimmed)) => {
             let _ = writeln!(prompt, "### {filename}\n");
-            // Use character-boundary-safe truncation for UTF-8
+            // Character-boundary-safe truncation for UTF-8.
             let truncated = if trimmed.chars().count() > max_chars {
                 trimmed
                     .char_indices()
                     .nth(max_chars)
                     .map(|(idx, _)| &trimmed[..idx])
-                    .unwrap_or(trimmed)
+                    .unwrap_or(trimmed.as_str())
             } else {
-                trimmed
+                trimmed.as_str()
             };
             if truncated.len() < trimmed.len() {
                 prompt.push_str(truncated);
@@ -390,13 +417,97 @@ fn inject_workspace_file(
                     "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
                 );
             } else {
-                prompt.push_str(trimmed);
+                prompt.push_str(&trimmed);
                 prompt.push_str("\n\n");
             }
         }
-        Err(_) => {
-            // Missing-file marker (matches OpenClaw behavior)
+        None => {
+            // No layer (workspace or any bundle) provides a non-empty file.
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_config::schema::SkillsPromptInjectionMode;
+
+    /// Build a prompt through the LIVE CLI builder with the given bundles +
+    /// workspace, defaulting the noise params.
+    fn live_prompt(workspace: &std::path::Path, bundles: &[ResolvedPersonaBundle]) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            workspace,
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            bundles,
+        )
+    }
+
+    fn bundle_with(files: &[(&str, &str)]) -> (tempfile::TempDir, ResolvedPersonaBundle) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+        let resolved =
+            ResolvedPersonaBundle::new(dir.path().to_path_buf(), "openclaw", vec![], vec![])
+                .unwrap();
+        (dir, resolved)
+    }
+
+    #[test]
+    fn live_path_injects_persona_bundle_soul() {
+        // The core "equip > author" path: an empty workspace + a bundle that
+        // supplies SOUL.md must put the bundle's SOUL into the system prompt.
+        let workspace = tempfile::tempdir().unwrap();
+        let (_b, bundle) = bundle_with(&[("SOUL.md", "PERSONA_BUNDLE_SOUL_MARKER")]);
+        let prompt = live_prompt(workspace.path(), std::slice::from_ref(&bundle));
+        assert!(
+            prompt.contains("PERSONA_BUNDLE_SOUL_MARKER"),
+            "live path must inject the bundle's SOUL.md"
+        );
+    }
+
+    #[test]
+    fn live_path_workspace_overrides_bundle() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("SOUL.md"), "WORKSPACE_SOUL_MARKER").unwrap();
+        let (_b, bundle) = bundle_with(&[("SOUL.md", "BUNDLE_SOUL_MARKER")]);
+        let prompt = live_prompt(workspace.path(), std::slice::from_ref(&bundle));
+        assert!(prompt.contains("WORKSPACE_SOUL_MARKER"));
+        assert!(
+            !prompt.contains("BUNDLE_SOUL_MARKER"),
+            "workspace SOUL.md must override the bundle's"
+        );
+    }
+
+    #[test]
+    fn live_path_injects_heartbeat_from_bundle() {
+        // Regression for the HEARTBEAT.md silent-skip: the live path never
+        // loaded HEARTBEAT.md before this change.
+        let workspace = tempfile::tempdir().unwrap();
+        let (_b, bundle) = bundle_with(&[("HEARTBEAT.md", "HEARTBEAT_MARKER")]);
+        let prompt = live_prompt(workspace.path(), std::slice::from_ref(&bundle));
+        assert!(
+            prompt.contains("HEARTBEAT_MARKER"),
+            "HEARTBEAT.md from a bundle must be injected on the live path"
+        );
+    }
+
+    #[test]
+    fn live_path_no_bundles_uses_workspace_only() {
+        // Backwards-compat: empty bundles == prior workspace-only behavior.
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("SOUL.md"), "WS_ONLY_SOUL_MARKER").unwrap();
+        let prompt = live_prompt(workspace.path(), &[]);
+        assert!(prompt.contains("WS_ONLY_SOUL_MARKER"));
     }
 }

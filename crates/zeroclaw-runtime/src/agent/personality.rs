@@ -8,6 +8,8 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use zeroclaw_config::schema::Config;
+
 /// Maximum characters per personality file before truncation.
 pub const MAX_FILE_CHARS: usize = 20_000;
 
@@ -195,43 +197,129 @@ pub fn load_personality_with_bundles(
     profile
 }
 
-/// Resolve and read a single personality file under bundle-overlay precedence
-/// (see [`load_personality_with_bundles`]). Returns the winning layer's file,
-/// or `None` if no layer provides a non-empty copy. Exposed so the live-CLI
-/// prompt path can share the exact same precedence as the ACP path.
-pub fn load_overlaid_file(
+/// Resolve an agent's configured `persona_bundles` (by alias, in order) into
+/// the overlay loader's [`ResolvedPersonaBundle`]s. Infallible by design: a
+/// bundle that is unconfigured, fails directory resolution, or declares an
+/// unsupported format is logged and skipped so one bad bundle never breaks a
+/// turn. (Dangling aliases are also surfaced at config load by
+/// `Config::validate`; an unsupported format is surfaced here.) Re-resolved
+/// per prompt build — no cache — so an operator editing bundle files or the
+/// config sees the change on the next turn.
+pub fn resolve_agent_persona_bundles(
+    config: &Config,
+    agent_alias: &str,
+) -> Vec<ResolvedPersonaBundle> {
+    let Some(agent) = config.agents.get(agent_alias) else {
+        return Vec::new();
+    };
+    if agent.persona_bundles.is_empty() {
+        return Vec::new();
+    }
+    let install_root = config.install_root_dir();
+    let mut resolved = Vec::with_capacity(agent.persona_bundles.len());
+    for alias in &agent.persona_bundles {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            continue;
+        }
+        // Dangling refs are already reported by Config::validate; skip quietly.
+        let Some(bundle_cfg) = config.persona_bundles.get(alias) else {
+            continue;
+        };
+        let directory =
+            match zeroclaw_config::persona_bundles::resolve_directory(config, &install_root, alias)
+            {
+                Ok(dir) => dir,
+                Err(_) => continue, // resolution failure already surfaced at validate
+            };
+        match ResolvedPersonaBundle::new(
+            directory,
+            &bundle_cfg.format,
+            bundle_cfg.include.clone(),
+            bundle_cfg.exclude.clone(),
+        ) {
+            Ok(bundle) => resolved.push(bundle),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": agent_alias,
+                            "persona_bundle": alias,
+                            "error": format!("{e}"),
+                        })),
+                    "persona bundle skipped: unsupported format"
+                );
+            }
+        }
+    }
+    resolved
+}
+
+/// Resolve a single personality file under bundle-overlay precedence and
+/// return the winning layer's path + trimmed (untruncated) content, or `None`
+/// if no layer provides a non-empty copy. Precedence, highest first: the
+/// agent's own `workspace_dir`, then bundles latest-listed first, then earlier
+/// bundles. Truncation is intentionally left to the caller because the live
+/// and ACP prompt paths cap files at different sizes — this is the single
+/// source of truth for the *precedence*, shared by both paths.
+pub fn resolve_overlaid_file(
     filename: &str,
     bundles: &[ResolvedPersonaBundle],
     workspace_dir: &Path,
-) -> Option<PersonalityFile> {
+) -> Option<(PathBuf, String)> {
     // Highest priority: the agent's own workspace (per-instance overrides).
-    if let Some(file) = read_personality_file(workspace_dir, filename) {
-        return Some(file);
+    if let Some(hit) = read_trimmed(workspace_dir, filename) {
+        return Some(hit);
     }
     // Then bundles, latest-listed first — later bundles overlay earlier ones.
     for bundle in bundles.iter().rev() {
         if !bundle.admits(filename) {
             continue;
         }
-        if let Some(file) = read_personality_file(&bundle.directory, filename) {
-            return Some(file);
+        if let Some(hit) = read_trimmed(&bundle.directory, filename) {
+            return Some(hit);
         }
     }
     None
 }
 
-/// Read one personality file from `dir`, returning `None` if it is absent or
-/// effectively empty (whitespace only). Applies the [`MAX_FILE_CHARS`] cap.
-/// Single source of truth for the read+empty+truncate rule shared by every
-/// loader entry point.
-fn read_personality_file(dir: &Path, filename: &str) -> Option<PersonalityFile> {
+/// Overlay-resolve `filename` and apply the [`MAX_FILE_CHARS`] cap, yielding a
+/// [`PersonalityFile`]. The ACP loader's per-file entry point.
+fn load_overlaid_file(
+    filename: &str,
+    bundles: &[ResolvedPersonaBundle],
+    workspace_dir: &Path,
+) -> Option<PersonalityFile> {
+    let (path, trimmed) = resolve_overlaid_file(filename, bundles, workspace_dir)?;
+    let (content, truncated) = truncate_content(&trimmed);
+    Some(PersonalityFile {
+        name: filename.to_string(),
+        content,
+        truncated,
+        path,
+    })
+}
+
+/// Read one personality file from `dir`, returning its path + trimmed content,
+/// or `None` if the file is absent or effectively empty (whitespace only). No
+/// truncation — the single source of truth for the read+empty rule.
+fn read_trimmed(dir: &Path, filename: &str) -> Option<(PathBuf, String)> {
     let path = dir.join(filename);
     let raw = std::fs::read_to_string(&path).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let (content, truncated) = truncate_content(trimmed);
+    Some((path, trimmed.to_string()))
+}
+
+/// Read one personality file from `dir` with the [`MAX_FILE_CHARS`] cap
+/// applied. `None` if absent or effectively empty.
+fn read_personality_file(dir: &Path, filename: &str) -> Option<PersonalityFile> {
+    let (path, trimmed) = read_trimmed(dir, filename)?;
+    let (content, truncated) = truncate_content(&trimmed);
     Some(PersonalityFile {
         name: filename.to_string(),
         content,
@@ -486,5 +574,85 @@ mod tests {
             ResolvedPersonaBundle::new(PathBuf::from("/tmp/x"), "openclaw", vec![], vec![]).is_ok()
         );
         assert!(ResolvedPersonaBundle::new(PathBuf::from("/tmp/x"), "", vec![], vec![]).is_ok());
+    }
+
+    // ── Config → bundle resolution bridge ────────────────────────────
+
+    fn config_with_persona_bundle(
+        agent: &str,
+        bundle_alias: &str,
+        directory: &Path,
+        format: &str,
+    ) -> Config {
+        use zeroclaw_config::schema::{AliasedAgentConfig, PersonaBundleConfig};
+        let mut config = Config::default();
+        config.persona_bundles.insert(
+            bundle_alias.to_string(),
+            PersonaBundleConfig {
+                directory: Some(directory.display().to_string()),
+                format: format.to_string(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            agent.to_string(),
+            AliasedAgentConfig {
+                persona_bundles: vec![bundle_alias.to_string()],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn resolve_agent_persona_bundles_maps_aliases_in_order() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut config = config_with_persona_bundle("rev", "a", dir_a.path(), "openclaw");
+        // Add a second bundle and reference both in order.
+        config.persona_bundles.insert(
+            "b".to_string(),
+            zeroclaw_config::schema::PersonaBundleConfig {
+                directory: Some(dir_b.path().display().to_string()),
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut("rev").unwrap().persona_bundles = vec!["a".into(), "b".into()];
+
+        let resolved = resolve_agent_persona_bundles(&config, "rev");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].directory, dir_a.path());
+        assert_eq!(resolved[1].directory, dir_b.path());
+    }
+
+    #[test]
+    fn resolve_agent_persona_bundles_skips_unsupported_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_persona_bundle("rev", "aieos_one", dir.path(), "aieos");
+        let resolved = resolve_agent_persona_bundles(&config, "rev");
+        assert!(
+            resolved.is_empty(),
+            "an aieos bundle is skipped (logged), not loaded as markdown"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_persona_bundles_skips_dangling_alias() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+        let mut config = Config::default();
+        config.agents.insert(
+            "rev".to_string(),
+            AliasedAgentConfig {
+                persona_bundles: vec!["nonexistent".into()],
+                ..Default::default()
+            },
+        );
+        assert!(resolve_agent_persona_bundles(&config, "rev").is_empty());
+    }
+
+    #[test]
+    fn resolve_agent_persona_bundles_empty_for_unknown_agent() {
+        let config = Config::default();
+        assert!(resolve_agent_persona_bundles(&config, "ghost").is_empty());
     }
 }

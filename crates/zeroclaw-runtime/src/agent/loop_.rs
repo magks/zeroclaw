@@ -3424,6 +3424,8 @@ pub async fn run(
             &mut deferred_section,
         );
         let agent_workspace = config.agent_workspace_dir(agent_alias);
+        let persona_bundles =
+            crate::agent::personality::resolve_agent_persona_bundles(&config, agent_alias);
         let mut system_prompt =
             crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
                 &agent_workspace,
@@ -3437,6 +3439,7 @@ pub async fn run(
                 config.skills.prompt_injection_mode,
                 config.effective_compact_context(agent_alias),
                 config.effective_max_system_prompt_chars(agent_alias),
+                &persona_bundles,
             );
 
         // Append structured tool-use instructions with schemas (only for non-native model_providers)
@@ -4604,6 +4607,8 @@ pub async fn process_message(
             &mut deferred_section,
         );
         let agent_workspace = config.agent_workspace_dir(agent_alias);
+        let persona_bundles =
+            crate::agent::personality::resolve_agent_persona_bundles(&config, agent_alias);
         let mut system_prompt =
             crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
                 &agent_workspace,
@@ -4617,6 +4622,7 @@ pub async fn process_message(
                 config.skills.prompt_injection_mode,
                 config.effective_compact_context(agent_alias),
                 config.effective_max_system_prompt_chars(agent_alias),
+                &persona_bundles,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
