@@ -13320,6 +13320,20 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
+/// Whether a freshly-created agent workspace should be seeded with the default
+/// bootstrap scaffold ([`ensure_bootstrap_files`]).
+///
+/// Returns `false` for a bundle-driven agent (non-empty `persona_bundles`):
+/// such an agent gets its identity from the persona-bundle overlay, which
+/// layers onto an *empty* workspace. Because the workspace overrides bundles,
+/// writing default scaffold files would clobber the bundle's SOUL/IDENTITY/etc.
+/// markdown — so the scaffold is skipped and the workspace stays empty for the
+/// overlay to fill.
+#[must_use]
+pub fn should_seed_bootstrap_files(agent: &AliasedAgentConfig) -> bool {
+    agent.persona_bundles.is_empty()
+}
+
 /// Ensure that essential bootstrap files exist in the workspace directory.
 ///
 /// When the workspace is created outside of `zeroclaw onboard` (e.g., non-tty
@@ -20303,6 +20317,21 @@ require_otp_to_resume = true
     }
 
     // ── Bootstrap files ─────────────────────────────────────
+
+    #[test]
+    async fn should_seed_bootstrap_files_skips_bundle_driven_agents() {
+        let mut agent = AliasedAgentConfig::default();
+        assert!(
+            should_seed_bootstrap_files(&agent),
+            "an agent without persona_bundles should be scaffolded"
+        );
+        agent.persona_bundles = vec!["some-bundle".into()];
+        assert!(
+            !should_seed_bootstrap_files(&agent),
+            "a bundle-driven agent must skip the bootstrap scaffold so the \
+             overlay is not clobbered"
+        );
+    }
 
     #[tokio::test]
     async fn ensure_bootstrap_files_creates_missing_files() {

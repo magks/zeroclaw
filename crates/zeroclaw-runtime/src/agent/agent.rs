@@ -677,8 +677,13 @@ impl Agent {
         // IDENTITY.md / USER.md / TOOLS.md / BOOTSTRAP.md) on first
         // run. Idempotent — never overwrites existing files; only
         // fills in the gaps so a freshly-created agent has a basic
-        // identity to load.
-        if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
+        // identity to load. Skipped for bundle-driven agents: a persona
+        // bundle overlays onto an empty workspace, and since the workspace
+        // wins over bundles, scaffolded defaults would clobber the bundle
+        // (see should_seed_bootstrap_files).
+        if zeroclaw_config::schema::should_seed_bootstrap_files(agent_cfg)
+            && let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await
+        {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
