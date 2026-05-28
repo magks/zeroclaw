@@ -396,6 +396,11 @@ pub struct Config {
     #[nested]
     pub mcp_bundles: HashMap<String, McpBundleConfig>,
 
+    /// Named persona bundles (`[persona_bundles.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub persona_bundles: HashMap<String, PersonaBundleConfig>,
+
     /// Named peer groups (`[peer_groups.<name>]`). Each entry binds a
     /// channel, a list of member agents, and optional non-agent
     /// (external) members and a per-group blocklist. Mutual opt-in:
@@ -2766,6 +2771,13 @@ pub struct AliasedAgentConfig {
     /// load.
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
+    /// Persona bundle aliases. Each entry references `persona_bundles[key]` —
+    /// a directory of persona identity markdown that overlays onto this
+    /// agent's workspace at prompt-build time. Additive and ordered: the
+    /// agent loads every listed bundle in order, later bundles win at the file
+    /// level, and the agent's own workspace files win over all bundles.
+    #[serde(default)]
+    pub persona_bundles: Vec<String>,
     /// Cron job aliases. Each entry references `cron[key]` — a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
@@ -2917,6 +2929,7 @@ impl Default for AliasedAgentConfig {
             skill_bundles: Vec::new(),
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
+            persona_bundles: Vec::new(),
             cron_jobs: Vec::new(),
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
@@ -9112,6 +9125,71 @@ pub struct McpBundleConfig {
     pub exclude: Vec<String>,
 }
 
+/// Named persona bundle (`[persona_bundles.<alias>]`).
+///
+/// A reusable directory of persona identity markdown (SOUL.md / IDENTITY.md /
+/// USER.md / AGENTS.md / TOOLS.md / HEARTBEAT.md / MEMORY.md) plus the
+/// declarative equipment the persona needs to do its job. An agent composes
+/// one or more bundles by alias; bundles overlay onto the agent workspace at
+/// prompt-build time (later bundles in the list win at the file level, and the
+/// agent's own workspace copy wins over every bundle — the workspace is the
+/// per-instance copy-on-write layer).
+///
+/// Unlike [`SkillBundleConfig`], persona bundles may live anywhere on disk the
+/// operator points them: personas are authored content, often kept in a
+/// dedicated library dir outside the install. They are trusted config — the
+/// security boundary for what a persona may *read at runtime* is the policy
+/// layer (`risk_profiles.<X>.allowed_roots`, plus a bundle's own
+/// `extra_allowed_roots`), not the bundle directory's location.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "persona-bundle"]
+#[serde(default)]
+pub struct PersonaBundleConfig {
+    /// Directory containing the persona's files. Absolute paths are used
+    /// verbatim; relative paths resolve against the install root; unset or
+    /// empty defaults to `<install>/shared/personas/<alias>/`.
+    pub directory: Option<String>,
+    /// Bundle format: `"openclaw"` (markdown, the default) or `"aieos"`
+    /// (AIEOS JSON). Only `"openclaw"` is loadable today; an `"aieos"` bundle
+    /// errors at load until AIEOS overlay support lands.
+    pub format: String,
+    /// Personality file names to include. Empty means every recognised
+    /// personality file present in `directory`.
+    pub include: Vec<String>,
+    /// Personality file names to exclude from this bundle.
+    pub exclude: Vec<String>,
+    /// Extra filesystem roots this persona needs to reach, merged additively
+    /// onto the agent's resolved `SecurityPolicy.allowed_roots` at policy
+    /// build time (parallels `risk_profiles.<X>.allowed_roots`). Source of
+    /// truth for "what extra roots *this* bundle requires"; the merged policy
+    /// is an on-demand view, never a stored copy.
+    pub extra_allowed_roots: Vec<String>,
+    /// Extra shell commands this persona needs beyond the framework defaults,
+    /// merged additively onto the agent's resolved
+    /// `SecurityPolicy.allowed_commands` (parallels
+    /// `risk_profiles.<X>.extra_allowed_commands`). Source of truth for "what
+    /// extra commands *this* bundle requires".
+    pub extra_allowed_commands: Vec<String>,
+}
+
+fn default_persona_bundle_format() -> String {
+    "openclaw".into()
+}
+
+impl Default for PersonaBundleConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            format: default_persona_bundle_format(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            extra_allowed_roots: Vec::new(),
+            extra_allowed_commands: Vec::new(),
+        }
+    }
+}
+
 // ── Runtime ──────────────────────────────────────────────────────
 
 /// Runtime adapter configuration (`[runtime]` section).
@@ -12879,6 +12957,7 @@ impl Default for Config {
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            persona_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -14651,6 +14730,7 @@ impl Config {
                     &agent.knowledge_bundles,
                 ),
                 ("mcp-bundles", "mcp_bundles", &agent.mcp_bundles),
+                ("persona-bundles", "persona_bundles", &agent.persona_bundles),
             ];
             for (section, field, values) in bare_multi {
                 for (i, key) in values.iter().enumerate() {
@@ -16151,6 +16231,7 @@ auto_save = true
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            persona_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
@@ -16748,6 +16829,7 @@ default_temperature = 0.7
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
             mcp_bundles: HashMap::new(),
+            persona_bundles: HashMap::new(),
             peer_groups: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
