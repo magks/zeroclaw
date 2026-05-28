@@ -22008,6 +22008,23 @@ allowed_users = []
     }
 
     #[test]
+    async fn validate_rejects_dangling_persona_bundle_ref() {
+        // The bare-alias bundle dangling-ref loop covers persona_bundles too
+        // (added alongside skill/knowledge/mcp). An agent referencing an
+        // unconfigured persona bundle must fail validation with the indexed
+        // field path so the dashboard can bind the error inline.
+        let mut config = multi_agent_test_config();
+        config.agents.get_mut("alpha").unwrap().persona_bundles = vec!["ghost".to_string()];
+        let err = config
+            .validate()
+            .expect_err("dangling persona_bundles ref must fail validation");
+        assert!(
+            err.to_string().contains("agents.alpha.persona_bundles[0]"),
+            "expected indexed field path, got: {err}"
+        );
+    }
+
+    #[test]
     async fn validate_rejects_peer_group_member_without_channel() {
         let mut config = multi_agent_test_config();
 
