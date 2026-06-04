@@ -19,8 +19,32 @@ use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
+///
+/// Exact match first. As a fallback, strip a single leading harmony-format
+/// namespace segment (`tools.` / `functions.`) and retry: models that emit
+/// namespaced tool calls — e.g. gpt-oss:20b emits `tools.web_search_tool` —
+/// otherwise fail exact matching with "Unknown tool". The fallback only fires
+/// when the exact name is absent, so it can never shadow a registered tool.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+    if let Some(t) = tools.iter().find(|t| t.name() == name) {
+        return Some(t.as_ref());
+    }
+    let stripped = strip_tool_namespace(name)?;
+    tools
+        .iter()
+        .find(|t| t.name() == stripped)
+        .map(|t| t.as_ref())
+}
+
+/// Strip a single leading harmony-format namespace prefix from a tool name.
+/// Returns `None` when no known prefix is present (so callers fall through to
+/// the unknown-tool path rather than re-matching the original name).
+pub fn strip_tool_namespace(name: &str) -> Option<&str> {
+    const PREFIXES: [&str; 4] = ["tools.", "functions.", "tool.", "function."];
+    PREFIXES
+        .iter()
+        .find_map(|p| name.strip_prefix(p))
+        .filter(|s| !s.is_empty())
 }
 
 // ── Outcome ──────────────────────────────────────────────────────────────
@@ -272,4 +296,28 @@ pub async fn execute_tools_sequential(
     }
 
     Ok(outcomes)
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::strip_tool_namespace;
+
+    #[test]
+    fn strips_known_harmony_prefixes() {
+        // gpt-oss:20b emits `tools.<name>`; some harmony variants use `functions.`.
+        assert_eq!(strip_tool_namespace("tools.web_search_tool"), Some("web_search_tool"));
+        assert_eq!(strip_tool_namespace("functions.web_search_tool"), Some("web_search_tool"));
+        assert_eq!(strip_tool_namespace("tool.file_read"), Some("file_read"));
+        assert_eq!(strip_tool_namespace("function.file_read"), Some("file_read"));
+    }
+
+    #[test]
+    fn leaves_unprefixed_and_empty_names_alone() {
+        // No known prefix → None, so callers fall through to the unknown-tool
+        // path instead of re-matching the original name.
+        assert_eq!(strip_tool_namespace("web_search_tool"), None);
+        assert_eq!(strip_tool_namespace("mcp__server__do"), None);
+        // A bare prefix with nothing after it is not a usable tool name.
+        assert_eq!(strip_tool_namespace("tools."), None);
+    }
 }
