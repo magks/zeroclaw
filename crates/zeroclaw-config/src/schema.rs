@@ -9722,6 +9722,20 @@ pub struct CronJobDecl {
     #[serde(default)]
     #[nested]
     pub delivery: Option<DeliveryConfigDecl>,
+    /// Optional pre-check guard command for `job_type = "agent"` jobs. Run on
+    /// every scheduled fire BEFORE the (metered) agent wake. If the guard
+    /// signals there is nothing to do, the agent run — and its LLM cost — is
+    /// skipped entirely. Wake decision: the guard's stdout is parsed as JSON
+    /// `{"wakeAgent": <bool>, "context": "<text>"}` when present; otherwise the
+    /// command's exit code decides (0 = wake, non-zero = skip). When it wakes,
+    /// the JSON `context` field (or, for non-JSON output, the raw stdout) is
+    /// spliced into the agent prompt so the guard can pass it cheap context
+    /// (e.g. "3 new items"). A guard that errors, times out, or is rejected by
+    /// policy fails OPEN (the agent still wakes) so a broken guard degrades to
+    /// the prior always-wake behaviour rather than silently dropping the job.
+    /// Validated and executed exactly like a `job_type = "shell"` command.
+    #[serde(default)]
+    pub guard_command: Option<String>,
 }
 
 impl Default for CronJobDecl {
@@ -9738,6 +9752,7 @@ impl Default for CronJobDecl {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            guard_command: None,
         }
     }
 }
