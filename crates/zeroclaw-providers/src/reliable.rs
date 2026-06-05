@@ -1638,7 +1638,6 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
-            thinking: None,
         };
         let result = model_provider
             .chat(request, "test", Some(0.0))
@@ -1749,7 +1748,6 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
-            thinking: None,
         };
         // Exhausting the empty re-rolls returns the last (blank) response rather
         // than erroring — strictly never worse than the pre-fix behavior.
@@ -1783,7 +1781,6 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
-            thinking: None,
         };
         let result = model_provider
             .chat(request, "test", Some(0.0))
