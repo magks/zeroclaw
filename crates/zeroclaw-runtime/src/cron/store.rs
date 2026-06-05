@@ -1986,6 +1986,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                guard_command: None,
             },
         )
     }
@@ -2012,6 +2013,7 @@ mod tests {
                 uses_memory: true,
                 session_target: None,
                 delivery: None,
+                guard_command: None,
             },
         )
     }
@@ -2199,6 +2201,7 @@ mod tests {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            guard_command: None,
         };
 
         let mut decls = std::collections::HashMap::new();

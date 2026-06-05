@@ -20,6 +20,16 @@ const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
+/// Timeout for a cron agent-job guard pre-check (`guard_command`). Kept short:
+/// the guard exists to cheaply decide whether to wake the (metered) agent, so
+/// it must not itself become a slow step.
+const CRON_GUARD_TIMEOUT_SECS: u64 = 30;
+
+/// Output prefix marking a cron run whose agent wake was suppressed by its
+/// `guard_command`. Recorded as the run output and recognised by
+/// `deliver_if_configured`, so a suppressed wake is never announced.
+pub(crate) const CRON_GUARD_SUPPRESS_MARKER: &str = "[cron-guard] wake suppressed";
+
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
@@ -143,6 +153,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             uses_memory: true,
             session_target: None,
             delivery: None,
+            guard_command: None,
         };
         ::zeroclaw_log::record!(
             DEBUG,
@@ -430,12 +441,198 @@ async fn execute_and_persist_job(
     (job.id.clone(), success, output)
 }
 
+/// Decision returned by a cron agent-job guard pre-check.
+enum GuardDecision {
+    /// No `guard_command` configured — run the agent normally.
+    NoGuard,
+    /// Guard authorised the wake; carries optional context to splice into the
+    /// agent prompt (empty when the guard produced none).
+    Wake(String),
+    /// Guard suppressed the wake; carries a short reason for logging/history.
+    Suppress(String),
+}
+
+/// Parse a guard command's stdout + exit status into `(wake, context)`.
+///
+/// Precedence: if stdout (or its last non-empty line) parses as a JSON object
+/// with a boolean `wakeAgent`, that wins; otherwise the exit code decides
+/// (success = wake). Context to splice into the prompt: the JSON `context`
+/// string field when present, else the raw trimmed stdout for non-JSON output
+/// (empty for a JSON object without `context`, or when suppressing).
+fn parse_guard_output(stdout: &str, exit_success: bool) -> (bool, String) {
+    let trimmed = stdout.trim();
+    // Try the whole output first, then the last non-empty line — this lets a
+    // guard print human-readable logs and end with a one-line JSON verdict.
+    let json = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .or_else(|| {
+            trimmed
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .and_then(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        });
+    if let Some(serde_json::Value::Object(map)) = json {
+        let wake = map
+            .get("wakeAgent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(exit_success);
+        let context = map
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let context = if wake { context } else { String::new() };
+        return (wake, context);
+    }
+    // Non-JSON: exit code decides; splice raw stdout as context when waking.
+    (
+        exit_success,
+        if exit_success {
+            trimmed.to_string()
+        } else {
+            String::new()
+        },
+    )
+}
+
+/// Evaluate a declarative agent job's optional `guard_command` before waking
+/// the (metered) agent. The guard is read from `config.cron[job.id]` — i.e.
+/// declarative (config-defined) agent jobs only. Validated and executed exactly
+/// like a `job_type = "shell"` command. Fails OPEN: a guard rejected by policy,
+/// that errors, or that times out still wakes the agent (with a warning) rather
+/// than silently dropping the job.
+async fn evaluate_cron_guard(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> GuardDecision {
+    let guard_cmd = match config
+        .cron
+        .get(&job.id)
+        .and_then(|d| d.guard_command.as_deref())
+    {
+        Some(c) if !c.trim().is_empty() => c.to_string(),
+        _ => return GuardDecision::NoGuard,
+    };
+
+    let warn_fail_open = |msg: &'static str, attr: serde_json::Value| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(attr),
+            msg
+        );
+    };
+
+    // Validate exactly like a shell job command (allowlist + risk + path).
+    if let Err(error) =
+        crate::cron::validate_shell_command_with_security(security, &guard_cmd, false)
+    {
+        warn_fail_open(
+            "cron guard rejected by security policy; waking agent (fail-open)",
+            ::serde_json::json!({"job_id": job.id, "error": error.to_string()}),
+        );
+        return GuardDecision::Wake(String::new());
+    }
+    if let Some(path) = security.forbidden_path_argument(&guard_cmd) {
+        warn_fail_open(
+            "cron guard has forbidden path argument; waking agent (fail-open)",
+            ::serde_json::json!({"job_id": job.id, "path": path}),
+        );
+        return GuardDecision::Wake(String::new());
+    }
+
+    let child = match build_cron_shell_command(&guard_cmd, &config.data_dir) {
+        Ok(mut cmd) => match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                warn_fail_open(
+                    "cron guard spawn failed; waking agent (fail-open)",
+                    ::serde_json::json!({"job_id": job.id, "error": e.to_string()}),
+                );
+                return GuardDecision::Wake(String::new());
+            }
+        },
+        Err(e) => {
+            warn_fail_open(
+                "cron guard setup failed; waking agent (fail-open)",
+                ::serde_json::json!({"job_id": job.id, "error": e.to_string()}),
+            );
+            return GuardDecision::Wake(String::new());
+        }
+    };
+
+    match time::timeout(
+        Duration::from_secs(CRON_GUARD_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let (wake, context) = parse_guard_output(&stdout, output.status.success());
+            if wake {
+                GuardDecision::Wake(context)
+            } else {
+                let t = stdout.trim();
+                let reason = if t.is_empty() {
+                    format!("guard exited {}", output.status)
+                } else {
+                    t.chars().take(200).collect()
+                };
+                GuardDecision::Suppress(reason)
+            }
+        }
+        Ok(Err(e)) => {
+            warn_fail_open(
+                "cron guard wait failed; waking agent (fail-open)",
+                ::serde_json::json!({"job_id": job.id, "error": e.to_string()}),
+            );
+            GuardDecision::Wake(String::new())
+        }
+        Err(_) => {
+            warn_fail_open(
+                "cron guard timed out; waking agent (fail-open)",
+                ::serde_json::json!({"job_id": job.id, "timeout_secs": CRON_GUARD_TIMEOUT_SECS}),
+            );
+            GuardDecision::Wake(String::new())
+        }
+    }
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
 ) -> (bool, String) {
+    // ── Guard pre-check ──────────────────────────────────────────────────
+    // For declarative agent jobs with a `guard_command`, decide whether this
+    // scheduled fire is worth a (metered) agent wake at all. A suppressed wake
+    // returns success with a marker output, so it is neither retried (see
+    // execute_job_with_retry) nor announced (see deliver_if_configured), and
+    // the agent/LLM is never invoked.
+    let guard_context = match evaluate_cron_guard(config, security, job).await {
+        GuardDecision::Suppress(reason) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": agent_alias,
+                        "reason": reason,
+                    })),
+                "cron guard suppressed agent wake (no LLM call)"
+            );
+            return (true, format!("{CRON_GUARD_SUPPRESS_MARKER}: {reason}"));
+        }
+        GuardDecision::Wake(ctx) => ctx,
+        GuardDecision::NoGuard => String::new(),
+    };
+
     // Cron is one of two SubAgent spawn sites; the other is the
     // agent-loop `spawn_subagent` tool. Both funnel through
     // `SubAgentSpawn::for_agent` so permission inheritance, tracing
@@ -514,7 +711,16 @@ async fn run_agent_job(
         }
     };
 
-    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+    // Splice any guard pre-check context into the prompt the agent sees (after
+    // memory recall, which stays scoped to the clean user prompt) so the agent
+    // can use what the cheap guard already found without re-fetching it.
+    let guard_block = if guard_context.is_empty() {
+        String::new()
+    } else {
+        format!("[guard context]\n{guard_context}\n\n")
+    };
+    let prefixed_prompt =
+        format!("{memory_context}{guard_block}[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
     let mut cron_config = config.clone();
@@ -739,6 +945,10 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+    // A guard-suppressed wake produced no real agent output — never announce it.
+    if output.starts_with(CRON_GUARD_SUPPRESS_MARKER) {
+        return Ok(());
+    }
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -965,6 +1175,70 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     const TEST_AGENT: &str = "test-agent";
+
+    // ── cron guard pre-check decision matrix ──────────────────────────────
+
+    #[test]
+    fn guard_json_wake_true_uses_context_field() {
+        let (wake, ctx) = parse_guard_output(r#"{"wakeAgent": true, "context": "3 new items"}"#, true);
+        assert!(wake);
+        assert_eq!(ctx, "3 new items");
+    }
+
+    #[test]
+    fn guard_json_wake_false_suppresses_and_drops_context() {
+        // wakeAgent=false wins even on a zero exit, and context is not spliced
+        // for a suppressed run.
+        let (wake, ctx) =
+            parse_guard_output(r#"{"wakeAgent": false, "context": "ignored"}"#, true);
+        assert!(!wake);
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn guard_json_wakeagent_overrides_exit_code() {
+        // JSON verdict beats a non-zero exit.
+        let (wake, _) = parse_guard_output(r#"{"wakeAgent": true}"#, false);
+        assert!(wake);
+        // ...and beats a zero exit the other way.
+        let (wake2, _) = parse_guard_output(r#"{"wakeAgent": false}"#, true);
+        assert!(!wake2);
+    }
+
+    #[test]
+    fn guard_json_without_wakeagent_falls_back_to_exit_code() {
+        let (wake, _) = parse_guard_output(r#"{"context": "hi"}"#, true);
+        assert!(wake);
+        let (wake2, _) = parse_guard_output(r#"{"context": "hi"}"#, false);
+        assert!(!wake2);
+    }
+
+    #[test]
+    fn guard_trailing_json_line_after_human_logs_is_parsed() {
+        let out = "checking inbox...\nfound nothing\n{\"wakeAgent\": false}";
+        let (wake, _) = parse_guard_output(out, true);
+        assert!(!wake);
+    }
+
+    #[test]
+    fn guard_non_json_uses_exit_code_and_splices_stdout_on_wake() {
+        let (wake, ctx) = parse_guard_output("2 unread emails", true);
+        assert!(wake);
+        assert_eq!(ctx, "2 unread emails");
+        // non-zero exit suppresses, no context spliced
+        let (wake2, ctx2) = parse_guard_output("nothing to do", false);
+        assert!(!wake2);
+        assert!(ctx2.is_empty());
+    }
+
+    #[test]
+    fn guard_empty_stdout_defers_to_exit_code() {
+        let (wake, ctx) = parse_guard_output("", true);
+        assert!(wake);
+        assert!(ctx.is_empty());
+        let (wake2, _) = parse_guard_output("   \n ", false);
+        assert!(!wake2);
+    }
 
     async fn test_config(tmp: &TempDir) -> Config {
         let mut config = Config {
