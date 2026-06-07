@@ -2326,7 +2326,17 @@ impl SecurityPolicy {
             delegation_policy: risk_profile.delegation_policy.clone(),
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: effective_workspace_only,
-            allowed_commands: risk_profile.allowed_commands.clone(),
+            // Merge `extra_allowed_commands` onto `allowed_commands` so a
+            // persona can add commands (e.g. `gh`, `rg`) without re-listing
+            // the entire default. Order: defaults first, extras appended.
+            // The shell tool's lookup is contains-based; duplicates are
+            // harmless.
+            allowed_commands: risk_profile
+                .allowed_commands
+                .iter()
+                .chain(risk_profile.extra_allowed_commands.iter())
+                .cloned()
+                .collect(),
             forbidden_paths: risk_profile.forbidden_paths.clone(),
             allowed_roots: risk_profile
                 .allowed_roots
@@ -2723,6 +2733,7 @@ mod tests {
             level: AutonomyLevel::ReadOnly,
             workspace_only: true,
             allowed_commands: vec!["only_this".into()],
+            extra_allowed_commands: vec!["extra_only".into()],
             forbidden_paths: vec!["/secret".into()],
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
@@ -2742,7 +2753,11 @@ mod tests {
 
         assert_eq!(policy.autonomy, AutonomyLevel::ReadOnly, "level → autonomy");
         assert!(policy.workspace_only, "workspace_only");
-        assert_eq!(policy.allowed_commands, vec!["only_this".to_string()]);
+        assert_eq!(
+            policy.allowed_commands,
+            vec!["only_this".to_string(), "extra_only".to_string()],
+            "extra_allowed_commands must be appended to allowed_commands"
+        );
         assert_eq!(policy.forbidden_paths, vec!["/secret".to_string()]);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
