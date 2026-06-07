@@ -417,6 +417,25 @@ impl DelegateTool {
         )
     }
 
+    /// Resolve `ModelProviderRuntimeOptions` for a delegate's OWN
+    /// `model_provider` alias (`"<family>.<alias>"`). Re-resolving per delegate
+    /// alias makes each sub-agent target its own family endpoint (the explicit
+    /// alias `uri`, else the family default via `resolved_endpoint_uri`) instead
+    /// of reusing the single inherited `provider_runtime_options`. Falls back to
+    /// the inherited options when the alias is bare (no `family.alias`) or no
+    /// `root_config` is attached (legacy unit-test constructors).
+    fn resolve_delegate_provider_options(
+        &self,
+        model_provider: &str,
+    ) -> zeroclaw_providers::ModelProviderRuntimeOptions {
+        match (model_provider.split_once('.'), self.root_config.as_deref()) {
+            (Some((family, alias)), Some(config)) => {
+                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
+            }
+            _ => self.provider_runtime_options.clone(),
+        }
+    }
+
     /// Resolve max delegation depth from the named runtime profile (default: 3).
     fn resolve_max_depth(&self, runtime_profile: &str) -> u32 {
         if runtime_profile.is_empty() {
@@ -759,12 +778,17 @@ impl DelegateTool {
             });
         }
 
-        // Create model_provider for this agent
+        // Create model_provider for this agent. Re-resolve runtime options for
+        // THIS delegate's own alias so an ollama (or any local) delegate posts
+        // to its own family endpoint instead of inheriting the shared
+        // `self.provider_runtime_options` (see `resolve_delegate_provider_options`).
+        let delegate_provider_options =
+            self.resolve_delegate_provider_options(&agent_config.model_provider);
         let model_provider: Box<dyn ModelProvider> =
             match zeroclaw_providers::create_model_provider_with_options(
                 &provider_type,
                 credential.as_deref(),
-                &self.provider_runtime_options,
+                &delegate_provider_options,
             ) {
                 Ok(p) => p,
                 Err(e) => {
