@@ -1083,6 +1083,7 @@ impl Agent {
             risk_profile,
             agent_alias,
             runtime,
+            observer.clone(),
             memory.clone(),
             composio_key,
             composio_entity_id,

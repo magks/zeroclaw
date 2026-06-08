@@ -759,6 +759,7 @@ pub async fn run_gateway(
                 &risk_profile,
                 agent_alias,
                 runtime,
+                Arc::new(zeroclaw_runtime::observability::NoopObserver),
                 Arc::clone(&mem),
                 composio_key,
                 composio_entity_id,
