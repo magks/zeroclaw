@@ -402,18 +402,62 @@ fn roots_contain(roots: &[PathBuf], expanded: &Path) -> bool {
 
 /// Subset check on two filesystem paths: returns `true` when `child`
 /// is the same as `parent` or a descendant of it. Used by the SubAgent
-/// escalation validator so a child can legitimately narrow `/srv` to
-/// `/srv/app` without the validator rejecting the narrowing as if it
-/// were a foreign path. Tries the canonical form first to handle
-/// symlinks consistently, then falls back to the literal path so
-/// not-yet-existing per-agent dirs (which do not canonicalize) still
-/// match.
+/// escalation validator (`ensure_no_escalation_beyond`) so a child can
+/// legitimately narrow `/srv` to `/srv/app` without the validator
+/// rejecting the narrowing as if it were a foreign path.
+///
+/// A child that RESOLVES on disk is judged by its CANONICAL destination —
+/// the location the runtime's path checks actually jail to
+/// (`is_resolved_path_allowed` / `is_resolved_path_readable` canonicalize
+/// every allowed root before `starts_with`). A child that is a SYMLINK
+/// (or contains `..`) whose canonical form escapes `parent` is therefore
+/// NOT contained, even when its literal path is nested under `parent`.
+/// This closes a symlink-to-broad-ancestor escalation: a child
+/// `allowed_root` / `workspace.access` grant that LITERALLY nests under a
+/// parent root but resolves to a broad ancestor would, with a literal
+/// comparison, read as "contained" while the runtime jail followed the
+/// symlink to that ancestor — a superset of the parent's region. A child
+/// that does NOT resolve (e.g. a not-yet-created per-agent workspace dir)
+/// falls back to the literal comparison so legitimate narrowing of an
+/// unmaterialized path still matches; that fallback can never mask the
+/// bypass, which requires the symlink to exist (and thus to resolve into
+/// the canonical branch). Mirrors the runtime's per-path canonicalize and
+/// the delegate gate's `workspace_jail`.
 fn path_contains(parent: &Path, child: &Path) -> bool {
     let canonical_parent = parent
         .canonicalize()
         .unwrap_or_else(|_| parent.to_path_buf());
-    let canonical_child = child.canonicalize().unwrap_or_else(|_| child.to_path_buf());
-    canonical_child.starts_with(&canonical_parent) || child.starts_with(parent)
+    match child.canonicalize() {
+        // Resolves on disk → canonical destination ONLY (no literal fallback
+        // that could mask a symlink-to-ancestor).
+        Ok(canonical_child) => canonical_child.starts_with(&canonical_parent),
+        // Does not resolve (not-yet-created dir) → literal fallback against BOTH
+        // the canonical and the literal parent, preserving narrowing even when
+        // an ancestor of `parent` is itself a symlink.
+        Err(_) => child.starts_with(&canonical_parent) || child.starts_with(parent),
+    }
+}
+
+/// Compares a child budget cap against a parent's under the
+/// `0 = inherit-the-global-default / unlimited` sentinel that both
+/// `max_cost_per_day_cents` and `shell_timeout_secs` document (schema.rs)
+/// and the runtime honors (e.g. `shell_timeout_secs == 0` falls back to
+/// `root_config.shell_tool.timeout_secs`, see runtime tools/mod.rs).
+/// Returns `true` when the child is BROADER than the parent — the
+/// escalation direction — treating `0` as the LARGEST (unlimited) value,
+/// NOT the smallest. A naive strict `child > parent` wrongly PASSES a
+/// child `0` (which resolves to the global default at runtime, broader
+/// than any finite parent) under a finite parent — the escalation this
+/// closes. Symmetric: a finite child under an unlimited (`0`) parent is
+/// narrower and accepted; both `0` are equal and accepted.
+fn budget_cap_exceeds<T: Default + PartialEq + PartialOrd>(child: T, parent: T) -> bool {
+    let unlimited = T::default(); // `0` for the integer cap fields
+    match (child == unlimited, parent == unlimited) {
+        (true, true) => false,  // both unlimited → equal reach, not an escalation
+        (true, false) => true,  // child unlimited, parent finite → child broader
+        (false, true) => false, // child finite, parent unlimited → child narrower
+        (false, false) => child > parent,
+    }
 }
 
 /// Specific kind of escalation violation returned by
@@ -2176,6 +2220,12 @@ impl SecurityPolicy {
     ///   and `self.max_cost_per_day_cents <=
     ///   parent.max_cost_per_day_cents`. A SubAgent cannot raise the
     ///   parent's rate or cost ceiling.
+    /// - `max_cost_per_day_cents` and `shell_timeout_secs` are compared
+    ///   with the `0 = inherit-global / unlimited` sentinel (schema.rs):
+    ///   a child `0` resolves to the global default at runtime (broader
+    ///   than any finite parent) and is therefore treated as the LARGEST
+    ///   value, so a child `0` under a finite parent is REFUSED. See
+    ///   [`budget_cap_exceeds`].
     ///
     /// Returns `Err(EscalationViolation)` describing the first
     /// violation found. Callers should reject the spawn on `Err` so
@@ -2261,13 +2311,16 @@ impl SecurityPolicy {
                 parent: parent.max_actions_per_hour,
             });
         }
-        if self.max_cost_per_day_cents > parent.max_cost_per_day_cents {
+        // `0` means "inherit the global default" for both caps (schema.rs), so
+        // a child `0` is BROADER than any finite parent, not narrower. Compare
+        // with the `0 = unlimited` sentinel rather than a naive strict `>`.
+        if budget_cap_exceeds(self.max_cost_per_day_cents, parent.max_cost_per_day_cents) {
             return Err(EscalationViolation::MaxCostExceeded {
                 child: self.max_cost_per_day_cents,
                 parent: parent.max_cost_per_day_cents,
             });
         }
-        if self.shell_timeout_secs > parent.shell_timeout_secs {
+        if budget_cap_exceeds(self.shell_timeout_secs, parent.shell_timeout_secs) {
             return Err(EscalationViolation::ShellTimeoutExceeded {
                 child: self.shell_timeout_secs,
                 parent: parent.shell_timeout_secs,
@@ -5246,6 +5299,121 @@ mod tests {
             EscalationViolation::ShellTimeoutExceeded { child, parent }
             if child == 600 && parent == 30
         ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_treats_zero_budget_caps_as_unlimited() {
+        // `0` means "inherit the global default" for both shell_timeout_secs and
+        // max_cost_per_day_cents (schema.rs); at runtime a `0` shell_timeout_secs
+        // resolves to root_config.shell_tool.timeout_secs (tools/mod.rs), broader
+        // than any finite parent. A naive strict `>` would PASS a child `0` under
+        // a finite parent — an escalation. `0` must compare as the LARGEST value.
+        // (parent_policy_for_escalation_tests has finite caps: max_cost=500,
+        // shell_timeout=60.)
+        let parent = parent_policy_for_escalation_tests();
+
+        // (a) child shell_timeout_secs=0 (unlimited) under a finite parent → REFUSE.
+        let child = SecurityPolicy {
+            shell_timeout_secs: 0,
+            ..parent.clone()
+        };
+        let err = child.ensure_no_escalation_beyond(&parent).expect_err(
+            "a child shell_timeout_secs=0 (unlimited) under a finite parent must be refused",
+        );
+        assert!(matches!(
+            err,
+            EscalationViolation::ShellTimeoutExceeded { child, parent }
+            if child == 0 && parent == 60
+        ));
+
+        // (b) child max_cost_per_day_cents=0 (unlimited) under a finite parent → REFUSE.
+        let child = SecurityPolicy {
+            max_cost_per_day_cents: 0,
+            ..parent.clone()
+        };
+        let err = child.ensure_no_escalation_beyond(&parent).expect_err(
+            "a child max_cost_per_day_cents=0 (unlimited) under a finite parent must be refused",
+        );
+        assert!(matches!(
+            err,
+            EscalationViolation::MaxCostExceeded { child, parent }
+            if child == 0 && parent == 500
+        ));
+
+        // (c) NO false refusal: a finite child under an UNLIMITED (0) parent is
+        // narrower → ALLOWED.
+        let unlimited_parent = SecurityPolicy {
+            shell_timeout_secs: 0,
+            max_cost_per_day_cents: 0,
+            ..parent.clone()
+        };
+        let child = SecurityPolicy {
+            shell_timeout_secs: 30,
+            max_cost_per_day_cents: 100,
+            ..parent.clone()
+        };
+        assert!(
+            child.ensure_no_escalation_beyond(&unlimited_parent).is_ok(),
+            "a finite child under an unlimited (0) parent must be allowed"
+        );
+
+        // (d) NO false refusal: both caps unlimited (0) → equal reach → ALLOWED.
+        let child = unlimited_parent.clone();
+        assert!(
+            child.ensure_no_escalation_beyond(&unlimited_parent).is_ok(),
+            "both caps unlimited (0) must be allowed (equal reach)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_contains_judges_resolvable_symlink_by_canonical_destination() {
+        // `path_contains` is the FS-containment predicate `ensure_no_escalation_beyond`
+        // uses for every allowed_roots / workspace.access grant. A child that
+        // RESOLVES on disk must be judged by its canonical destination, NOT its
+        // literal nesting — so a symlink literally nested under `parent` but
+        // resolving to a broad ANCESTOR is NOT contained (the runtime jail would
+        // otherwise follow the symlink to that ancestor, a superset of parent).
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let parent = root_path.join("shared");
+        std::fs::create_dir_all(&parent).expect("mkdir shared");
+
+        // (a) symlink nested under parent but resolving to the broad ancestor →
+        // NOT contained (the bypass, now closed).
+        let escape = parent.join("escape");
+        std::os::unix::fs::symlink(&root_path, &escape).expect("symlink escape -> root");
+        assert!(
+            !path_contains(&parent, &escape),
+            "a symlink resolving to a broad ancestor must NOT be contained"
+        );
+
+        // (b) NO false refusal: a symlink whose canonical target is genuinely
+        // UNDER parent is still contained.
+        let real_sub = parent.join("real_sub");
+        std::fs::create_dir_all(&real_sub).expect("mkdir real_sub");
+        let inward = parent.join("inward");
+        std::os::unix::fs::symlink(&real_sub, &inward).expect("symlink inward -> real_sub");
+        assert!(
+            path_contains(&parent, &inward),
+            "a symlink resolving under parent must still be contained"
+        );
+
+        // (c) NO false refusal: a not-yet-created child literally nested under
+        // parent is contained via the literal fallback (the not-materialized case).
+        let ghost = parent.join("notyet").join("deep");
+        assert!(
+            path_contains(&parent, &ghost),
+            "a not-yet-created child nested under parent must be contained"
+        );
+
+        // (d) a real path entirely outside parent → not contained.
+        let outside = root_path.join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        assert!(
+            !path_contains(&parent, &outside),
+            "a path outside parent must not be contained"
+        );
     }
 
     #[test]

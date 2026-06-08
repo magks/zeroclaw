@@ -1,4 +1,4 @@
-use crate::agent::loop_::{TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{AgentRunOverrides, TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -346,12 +346,17 @@ impl DelegateTool {
     ///      (narrower) policy; non-agentic delegates have no tool registry,
     ///      so there is no escalation surface.
     ///    - **Different profile, target broader** → refused (escalation).
-    ///    - **Different profile, agentic** → refused. The in-process agentic
-    ///      delegate loop reuses the caller's `parent_tools`, each bound to
-    ///      the caller's `Arc<SecurityPolicy>` at construction; running them
-    ///      for a different-profile target would enforce the CALLER's policy,
-    ///      not the target's — an escalation. Narrowed *agentic* runs go
-    ///      through `spawn_subagent` / a shared profile.
+    ///    - **Different profile, agentic, target narrower** → allowed via
+    ///      registry-rebuild. The in-process agentic loop reuses the caller's
+    ///      `parent_tools` (bound to the caller's policy), so this case is NOT
+    ///      run in-process; the dispatch routes it through `crate::agent::run`
+    ///      under the TARGET's policy ([`Self::execute_agentic_cross_profile`]),
+    ///      which rebuilds the tool registry from scratch under the validated
+    ///      child policy (allowed_tools minus `delegate`; `is_subagent`), so the
+    ///      caller's tools never enter it. Additional agentic-only gates: the
+    ///      target's own `workspace_dir` must not be broader than (contain) the
+    ///      caller's, and the target must declare an explicit `allowed_tools`
+    ///      allowlist.
     ///
     /// The returned policy's `tracker` is the caller's `Arc`-shared tracker
     /// so delegated actions count against the caller's `max_actions_per_hour`
@@ -463,18 +468,27 @@ impl DelegateTool {
         // Narrowing gate: the target's grants must be no broader than the
         // caller's. A BROADER target is a privilege escalation → refuse.
         //
-        // NOTE — one filesystem dimension is deliberately NOT compared here:
-        // each agent's OWN `workspace_dir` location/breadth (an operator-set
-        // `agents.<a>.workspace.path`). `profile_grants` neutralizes it (both
-        // agents share the sentinel base), because comparing it would refuse
-        // ALL cross-profile delegation (sibling agents always have distinct,
-        // non-nested own workspaces). A target with a custom `workspace.path`
-        // onto a large/foreign subtree is therefore NOT caught by this gate.
-        // It is inert on the only path the gate allows today (non-agentic,
-        // toolless — no filesystem tool runs); it MUST be addressed before
-        // cross-profile AGENTIC delegation (where the target would run FS
-        // tools jailed to that workspace) is enabled. Tracked as a follow-up,
-        // alongside the out-of-scope 0-sentinel shell_timeout/max_cost item.
+        // NOTE — this `ensure_no_escalation_beyond` comparison deliberately does
+        // NOT compare each agent's OWN `workspace_dir` location/breadth (an
+        // operator-set `agents.<a>.workspace.path`): `profile_grants` neutralizes
+        // it (both agents share the sentinel base), because comparing it
+        // unconditionally would refuse ALL cross-profile delegation (sibling
+        // agents always have distinct, non-nested own workspaces). That
+        // neutralization is correct for the NON-AGENTIC path (toolless — no
+        // filesystem tool runs, so the own-workspace breadth is inert). For the
+        // AGENTIC path the own-`workspace_dir` breadth IS compared, in the
+        // agentic branch below (refusing a target whose own workspace contains /
+        // is broader than the caller's), since an agentic target runs
+        // FS-capable tools jailed to that workspace.
+        //
+        // NOTE — the OTHER cross-agent FS dimension, `workspace.access` sibling
+        // grants, IS compared HERE: `profile_grants` re-applies them into
+        // `allowed_roots`/`_read_only`/`_write_only`, and this call compares them
+        // against the caller's via `path_contains`, which (since the AGFIX) does
+        // a canonical-jail comparison — so a sibling `workspace.path` symlinked
+        // to a broad ancestor is judged by its canonical destination, not its
+        // literal nesting (closing the same symlink bypass FIX 1 closed for the
+        // own `workspace_dir`; see policy.rs `path_contains`).
         if let Err(escalation) = target_grants.ensure_no_escalation_beyond(&caller_grants) {
             return Err(format!(
                 "delegate target {target_alias:?} (risk profile {target_profile:?}) would \
@@ -483,46 +497,165 @@ impl DelegateTool {
                 self.security.risk_profile_name
             ));
         }
-        // `ensure_no_escalation_beyond` does not cover tool authorization;
-        // close the `allowed_tools` / `excluded_tools` dimension explicitly.
-        if let Err(tool) = Self::target_tools_within_caller(&caller_grants, &target_grants) {
-            return Err(format!(
-                "delegate target {target_alias:?} would authorize {tool}, which the caller's \
-                 profile ({:?}) does not permit — delegation is narrowing-only.",
-                self.security.risk_profile_name
-            ));
-        }
-        // Nor does it cover the approval (auto_approve / always_ask) or
-        // sandbox dimensions; a target that relaxes any of these runs broader
-        // than the caller even when every grant above is narrower.
-        if let Err(reason) =
-            Self::target_approval_sandbox_within_caller(&caller_grants, &target_grants)
-        {
-            return Err(format!(
-                "delegate target {target_alias:?} {reason}, which the caller's profile ({:?}) \
-                 enforces — delegation is narrowing-only.",
-                self.security.risk_profile_name
-            ));
-        }
-        // Agentic cross-profile guard: the in-process agentic delegate loop
-        // reuses the caller's `parent_tools` (bound to the caller's policy),
-        // so a different-profile agentic target would run tools under the
-        // CALLER's policy — an escalation. Non-agentic targets have no tool
-        // registry and are safe.
+        // The tool-authorization, approval, and sandbox subset checks below
+        // govern what a target may DO with a tool registry. They have a runtime
+        // effect — and therefore constitute an escalation surface — ONLY for an
+        // AGENTIC target, which actually builds and runs a tool registry. A
+        // NON-AGENTIC delegate runs a single toolless `chat()` call (`tools:
+        // None`, no tool-call loop — see `execute_sync`'s non-agentic branch):
+        // it can invoke no tool, trips no approval prompt, and executes nothing
+        // sandboxed, so these dimensions are runtime-INERT for it. (This is the
+        // original Option-C insight: a non-agentic delegate has no tool registry
+        // and no escalation surface. Applying these tool/approval/sandbox subset
+        // checks to non-agentic targets unconditionally — e.g. refusing an
+        // empty-`allowed_tools` toolless delegate under a caller that restricts
+        // its own allowlist, or one inheriting a broad default `auto_approve` —
+        // false-refuses the toolless delegate roster.) The grant ceiling
+        // (`ensure_no_escalation_beyond`, above) still bounds EVERY target,
+        // agentic or not.
         let target_agentic = config
             .runtime_profiles
             .get(target_agent.runtime_profile.trim())
             .map(|rp| rp.agentic)
             .unwrap_or(false);
         if target_agentic {
-            return Err(format!(
-                "delegate target {target_alias:?} is agentic and on a different risk profile \
-                 ({target_profile:?}) than the caller ({:?}); cross-profile AGENTIC delegation \
-                 is not supported on the in-process delegate path (the agentic loop reuses the \
-                 caller's tool registry, bound to the caller's policy). Use spawn_subagent for a \
-                 narrowed agentic run, or place the target on the caller's risk profile.",
-                self.security.risk_profile_name
-            ));
+            // Cross-profile AGENTIC delegation is ENABLED via registry-rebuild.
+            // The in-process agentic loop reuses the caller's `parent_tools`
+            // (bound to the caller's policy), which would run a different-profile
+            // target's tools under the CALLER's policy — an escalation. So a
+            // cross-profile AGENTIC target is instead dispatched through
+            // `crate::agent::run` under the TARGET's policy (registry rebuilt;
+            // `allowed_tools` minus `delegate`; `is_subagent`), exactly as
+            // `spawn_subagent` does — see `execute_agentic_cross_profile`. The
+            // caller's tools never enter that registry. The tool / approval /
+            // sandbox / own-workspace checks below all gate this agentic path.
+
+            // Tool authorization (`allowed_tools` / `excluded_tools`) — a
+            // dimension `ensure_no_escalation_beyond` does not cover.
+            if let Err(tool) = Self::target_tools_within_caller(&caller_grants, &target_grants) {
+                return Err(format!(
+                    "delegate target {target_alias:?} would authorize {tool}, which the caller's \
+                     profile ({:?}) does not permit — delegation is narrowing-only.",
+                    self.security.risk_profile_name
+                ));
+            }
+            // Approval (auto_approve / always_ask) + sandbox dimensions; a target
+            // that relaxes any of these runs broader than the caller even when
+            // every grant above is narrower.
+            if let Err(reason) =
+                Self::target_approval_sandbox_within_caller(&caller_grants, &target_grants)
+            {
+                return Err(format!(
+                    "delegate target {target_alias:?} {reason}, which the caller's profile ({:?}) \
+                     enforces — delegation is narrowing-only.",
+                    self.security.risk_profile_name
+                ));
+            }
+            // (Part 1) Own-workspace breadth. `profile_grants` neutralizes each
+            // agent's own `workspace_dir` to a shared sentinel (so distinct
+            // sibling workspaces never false-refuse), and
+            // `ensure_no_escalation_beyond` therefore never compares it. That is
+            // inert for a non-agentic target (it runs no FS tools), but an
+            // AGENTIC target runs filesystem-capable tools jailed to its OWN
+            // workspace — so that jail must not be BROADER than the caller's.
+            //
+            // Compare the CANONICALIZED jails the runtime actually enforces, not
+            // a canonical-OR-literal mix. `is_resolved_path_allowed` /
+            // `is_resolved_path_readable` jail every file tool to
+            // `canonicalize(workspace_dir)` (policy.rs), and the file tools
+            // canonicalize the accessed path (file_read.rs) — so a target whose
+            // `workspace.path` is LITERALLY nested under the caller's but is a
+            // SYMLINK to a broad ancestor is, at runtime, jailed to that broad
+            // canonical destination: a strict SUPERSET of the caller's region.
+            // The prior `path_within` (canonical-OR-literal) was bypassed by
+            // exactly that shape — the literal fallback read the symlink as
+            // "contained" in the caller, masking the escalation (HIGH hole, see
+            // _scratch/zcupgrade-agentic-escalation-audit.json). `workspace_jail`
+            // resolves each path as the runtime does (canonical when it resolves
+            // on disk, literal otherwise), so a resolvable symlink is judged by
+            // its canonical destination. Refuse ONLY when the target's jail
+            // STRICTLY CONTAINS the caller's (caller under target, not
+            // vice-versa): the sole superset case. A descendant (narrower), an
+            // identical jail, and a DISTINCT non-nested sibling are NOT
+            // escalations — this deliberately does not reintroduce the sibling
+            // false-refusal HARDEN avoided. A not-yet-created workspace (which
+            // does not canonicalize) still compares by its literal form. (An
+            // unrestricted target, `workspace_only=false`, is already refused
+            // upstream by `ensure_no_escalation_beyond`'s
+            // `WorkspaceOnlyDisabledByChild` when the caller is jailed.)
+            let caller_ws = config.agent_workspace_dir(self.caller_alias.as_str());
+            let target_ws = config.agent_workspace_dir(target_alias);
+            let caller_jail = Self::workspace_jail(&caller_ws);
+            let target_jail = Self::workspace_jail(&target_ws);
+            if target_grants.workspace_only
+                && caller_jail.starts_with(&target_jail)
+                && !target_jail.starts_with(&caller_jail)
+            {
+                return Err(format!(
+                    "delegate target {target_alias:?} is agentic and its own workspace \
+                     {target_ws:?} (resolves to {target_jail:?}) contains (is broader than) the \
+                     caller's workspace {caller_ws:?} (resolves to {caller_jail:?}); its \
+                     filesystem-capable tools would reach a superset of the caller's region. \
+                     Delegation is narrowing-only.",
+                ));
+            }
+            // KNOWN RESIDUAL (HIGH-if-reachable; inert for arbot today; see
+            // _scratch/zcupgrade-agentic-escalation-audit.json + this branch's
+            // AGFIX review). FS breadth has a THIRD dimension this gate does NOT
+            // yet compare: workspace-RELATIVE risk-profile `allowed_roots` (and
+            // the identically-shaped persona-bundle `extra_allowed_roots`).
+            // `profile_grants` builds the comparison policy on the shared
+            // `GRANT_CMP_WORKSPACE` sentinel (so distinct sibling workspaces do
+            // not false-refuse), which resolves a relative root to
+            // `<sentinel>/<rel>` for BOTH agents — identical text → passes
+            // `ensure_no_escalation_beyond`, and the sentinel path never exists
+            // so the canonical `path_contains` is a no-op there. But the dispatched
+            // `for_agent` policy anchors the SAME relative root to each agent's
+            // REAL workspace (`<target_ws>/<rel>`); if that is an on-disk SYMLINK
+            // to a broad ancestor, the sub-agent's FS jail follows it (a superset
+            // of the caller's region, whose `<caller_ws>/<rel>` is a normal dir).
+            // Part-1 above compares only the workspace_dir ITSELF, not its `<rel>`
+            // subpaths, so a target on a distinct-but-narrower sibling workspace
+            // smuggles the escape through. This is a DIFFERENT root cause than the
+            // FIX-1 own-`workspace_dir` / FIX-1b `workspace.access` symlink holes
+            // (which the canonical jails now close): it is the sentinel-anchoring's
+            // deliberate blindness to real-workspace structure. A correct fix is
+            // DESIGN-LEVEL — recompute each agent's REAL-workspace-resolved +
+            // canonicalized relative roots and refuse a target relative root whose
+            // canonical destination escapes BOTH the target's own workspace jail
+            // AND the caller's same-relative-root resolution — and MUST preserve
+            // the legitimate cases the sentinel-anchoring exists to allow (a
+            // distinct private `<ws>/<rel>` subdir, and a shared `..`-relative
+            // root both agents resolve identically), i.e. it must not reintroduce
+            // the sibling/shared-root false-refusal the HARDEN avoided. Deferred
+            // (operator-away, out of the AGFIX's Part-1 scope, regression-prone,
+            // and INERT for arbot — research_assistant declares no workspace-
+            // relative FS-write `allowed_roots`). HARDENING CHECKLIST: close this
+            // before configuring ANY cross-profile agentic target with a
+            // workspace-relative FS-write `allowed_root` (risk profile or persona).
+            //
+            // (Part 2) The rebuilt sub-agent registry runs under an explicit
+            // least-privilege allowlist = target.allowed_tools minus `delegate`.
+            // Require it non-empty: a tool-unrestricted agentic target cannot be
+            // safely rebuilt minimally (it would either re-admit `delegate` —
+            // re-delegation — or produce a zero-tool agent). This is strictly
+            // tighter than the prior blanket refusal, so it introduces no
+            // regression.
+            let target_allowed = config
+                .risk_profiles
+                .get(target_profile)
+                .map(|rp| rp.allowed_tools.clone())
+                .unwrap_or_default();
+            if Self::agentic_rebuild_allowlist(&target_allowed).is_empty() {
+                return Err(format!(
+                    "delegate target {target_alias:?} is agentic on a different risk profile \
+                     ({target_profile:?}) but declares no explicit non-`delegate` allowed_tools; \
+                     cross-profile agentic delegation requires an explicit tool allowlist so the \
+                     sub-agent registry can be rebuilt minimally under the target's own policy.",
+                ));
+            }
+            // All narrowing + workspace-breadth + tool checks passed → ALLOW.
+            // The dispatch rebuilds the registry under the target's policy.
         }
         Ok(())
     }
@@ -578,6 +711,42 @@ impl DelegateTool {
         }
         policy.merge_persona_bundle_equipment(config, alias);
         Some(policy)
+    }
+
+    /// The filesystem jail the runtime actually enforces for a workspace
+    /// directory: its CANONICAL form when it resolves on disk, else the literal
+    /// path. Mirrors exactly what `is_resolved_path_allowed` /
+    /// `is_resolved_path_readable` compute for `workspace_dir`
+    /// (`workspace_dir.canonicalize().unwrap_or_else(|_| workspace_dir)`,
+    /// policy.rs). Comparing two jails with `Path::starts_with` therefore judges
+    /// a SYMLINKED `workspace.path` by its canonical destination — the broad dir
+    /// the runtime would expose — rather than by its literal nesting. (The prior
+    /// `path_within` used a canonical-OR-literal mix whose literal fallback could
+    /// be tricked into reading a symlink-to-ancestor as "contained" in the
+    /// caller, masking the escalation.) A not-yet-created workspace (which does
+    /// not canonicalize) falls back to its literal path, so a legitimately
+    /// nested-but-unmaterialized target still compares correctly.
+    fn workspace_jail(ws: &Path) -> PathBuf {
+        ws.canonicalize().unwrap_or_else(|_| ws.to_path_buf())
+    }
+
+    /// The least-privilege tool allowlist a cross-profile AGENTIC delegate's
+    /// rebuilt registry runs under: the target's own `allowed_tools` with blank
+    /// entries trimmed out and `delegate` removed. Stripping `delegate`
+    /// preserves the no-re-delegation / depth-1 invariant — the rebuilt
+    /// sub-agent is handed no `delegate` tool, so it cannot delegate again
+    /// (`spawn_subagent`, if listed, is separately neutralized by
+    /// `AgentRunOverrides.is_subagent = true`). An empty result means the
+    /// target declares no usable non-`delegate` tool; the cross-profile agentic
+    /// gate refuses such a target because it cannot be expressed as a minimal
+    /// rebuild without either re-admitting `delegate` or yielding a zero-tool
+    /// agent.
+    fn agentic_rebuild_allowlist(allowed_tools: &[String]) -> Vec<String> {
+        allowed_tools
+            .iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty() && t != "delegate")
+            .collect()
     }
 
     /// Returns `Err(descriptor)` if the target's EFFECTIVE tool authorization
@@ -1138,13 +1307,21 @@ impl DelegateTool {
             });
         }
 
-        if let Err(e) = self.policy_for_target(agent_name) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("{e:#}")),
-            });
-        }
+        // Validate + resolve the target's policy (narrowing-only gate). The
+        // resolved `Arc<SecurityPolicy>` is reused by the cross-profile agentic
+        // rebuild path below; the non-agentic / same-profile-agentic paths do
+        // not read it (their enforcement is the gate itself / the in-process
+        // policy), but resolving once keeps a single gate evaluation.
+        let target_policy = match self.policy_for_target(agent_name) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{e:#}")),
+                });
+            }
+        };
 
         // Create model_provider for this agent. Re-resolve runtime options for
         // THIS delegate's own alias so an ollama (or any local) delegate posts
@@ -1179,6 +1356,42 @@ impl DelegateTool {
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agentic {
+            // Cross-profile agentic delegation runs under the TARGET's own
+            // rebuilt registry (least-privilege) via `crate::agent::run`, NOT
+            // the in-process loop — which reuses the caller's `parent_tools`,
+            // each bound to the CALLER's policy (running them for a
+            // different-profile target would be an escalation). Same-profile
+            // agentic keeps the unchanged in-process path (caller policy ==
+            // target policy, so the reused tools enforce exactly the right
+            // policy).
+            //
+            // Detect cross-profile by the CALLER ALIAS's configured risk
+            // profile — NOT `self.security`. The background / parallel paths
+            // reconstruct this `DelegateTool` with `self.security` already
+            // swapped to the target policy (so a `self.security`-based check
+            // would wrongly read "same profile" and run the in-process loop with
+            // the caller's tools), but they preserve `caller_alias` +
+            // `root_config`. Keying off `caller_alias` is therefore the signal
+            // that survives all three dispatch sites and routes them alike.
+            let cross_profile = self.root_config.as_ref().is_some_and(|config| {
+                config
+                    .agents
+                    .get(self.caller_alias.as_str())
+                    .is_some_and(|caller| {
+                        caller.risk_profile.trim() != agent_config.risk_profile.trim()
+                    })
+            });
+            if cross_profile {
+                return self
+                    .execute_agentic_cross_profile(
+                        agent_name,
+                        agent_config,
+                        Arc::clone(&target_policy),
+                        &full_prompt,
+                        temperature,
+                    )
+                    .await;
+            }
             return self
                 .execute_agentic(
                     agent_name,
@@ -2181,6 +2394,168 @@ impl DelegateTool {
                     success: true,
                     output: format!(
                         "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
+                    ),
+                    error: None,
+                })
+            }
+            Ok(Err(e)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+            }),
+            Err(_) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
+                )),
+            }),
+        }
+    }
+
+    /// Cross-profile AGENTIC delegation: run the target sub-agent under its OWN
+    /// rebuilt tool registry (least-privilege) instead of the in-process loop
+    /// that reuses the caller's `parent_tools`.
+    ///
+    /// Routes through `crate::agent::run(target_alias, …, AgentRunOverrides {
+    /// security: Some(target_policy), is_subagent: true, .. })` — the same
+    /// rebuild `spawn_subagent` uses — so `tools::all_tools_with_runtime`
+    /// constructs every tool under the TARGET's `SecurityPolicy` + risk profile
+    /// (path enforcement, allowed_roots, workspace jail), then
+    /// `apply_policy_tool_filter` retains only the target policy's `allowed_tools`
+    /// ∩ the caller-supplied allowlist. That caller-supplied allowlist is the
+    /// target's `allowed_tools` MINUS `delegate`, so the rebuilt sub-agent is
+    /// handed no `delegate` tool (no re-delegation); `is_subagent = true`
+    /// separately caps `spawn_subagent` (depth-1). The validated `target_policy`
+    /// carries the caller's shared `tracker`, so the sub-agent's actions count
+    /// against the caller's budgets.
+    ///
+    /// The caller's `parent_tools` never enter this registry — that is the
+    /// escalation the in-process path could not avoid and the reason
+    /// cross-profile agentic was refused before this wiring. The cross-profile
+    /// narrowing gate ([`Self::cross_profile_decision`]) has already verified
+    /// the target is no broader than the caller (incl. own-workspace breadth)
+    /// and declares an explicit non-`delegate` allowlist.
+    ///
+    /// DEFERRED HARDENING — registry-overlay bypass (audit MED/LOW, see
+    /// `_scratch/zcupgrade-agentic-escalation-audit.json` →
+    /// `confirmed_real_holes` + `hardening_optional`). The rebuilt registry is
+    /// the overlay (`allowed_tools` minus `delegate`) PLUS whatever the target's
+    /// own `loop_.rs` registry build appends AFTER `apply_policy_tool_filter`.
+    /// Each item below is bounded by the target≤caller grant ceiling (every such
+    /// tool is built under the TARGET `SecurityPolicy`, and a re-delegation
+    /// re-enters this full narrowing gate), is operator-config-gated, and is
+    /// pre-existing generic behavior — none leaks the caller's `parent_tools`.
+    /// They are INERT for arbot today (research_assistant declares no skills,
+    /// pipeline, MCP, or shell). Treat this as the checklist to close in
+    /// `loop_.rs` (the shared agent-loop path — deliberately NOT modified here)
+    /// BEFORE a cross-profile agentic delegate is configured with any of:
+    ///   1. Skill tools — `register_skill_tools_with_context` runs after the
+    ///      overlay filter with no re-filter; a `kind=builtin target=delegate`
+    ///      skill can re-admit a `delegate` capability the overlay stripped, and
+    ///      `kind=shell/script` skills run beyond the overlay. Fix: re-apply
+    ///      `apply_policy_tool_filter` after skill registration on the
+    ///      `is_subagent` path and exclude `delegate` from skill-builtin
+    ///      elevation targets for sub-agents.
+    ///   2. Pipeline (`[pipeline]` enabled) — `PipelineTool` snapshots
+    ///      `tool_arcs` BEFORE the overlay filter and gates steps by its own
+    ///      `pipeline.allowed_tools`, so `execute_pipeline` can reach
+    ///      shell/delegate the overlay removed. Fix: build the captured arc set
+    ///      from the POST-overlay registry (or intersect with the overlay).
+    ///   3. Eager MCP — eager `mcp_*` tools are pushed AFTER the overlay filter
+    ///      with no re-filter (the deferred MCP path already honors it). Fix:
+    ///      route the eager push through the same overlay filter, and model
+    ///      `mcp_*` names in the gate's tool-subset comparison.
+    ///
+    /// Separately, a HIGH-if-reachable FS-breadth residual (workspace-RELATIVE
+    /// `allowed_roots` / persona `extra_allowed_roots` symlink escape, a
+    /// design-level gap in `profile_grants`' sentinel-anchoring) is documented at
+    /// the `KNOWN RESIDUAL` note in [`Self::cross_profile_decision`]; close it
+    /// before configuring a cross-profile agentic target with any workspace-
+    /// relative FS-write `allowed_root`. Inert for arbot today.
+    async fn execute_agentic_cross_profile(
+        &self,
+        agent_name: &str,
+        agent_config: &AliasedAgentConfig,
+        target_policy: Arc<SecurityPolicy>,
+        full_prompt: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ToolResult> {
+        let Some(config) = self.root_config.as_ref() else {
+            // Unreachable in production: the dispatch only routes here when
+            // `root_config` is set. Stay defensive — without config there is no
+            // registry to rebuild, and falling back to the in-process loop would
+            // reuse the caller's tools (the escalation we are avoiding).
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Agent '{agent_name}' requires a loaded config for cross-profile agentic delegation"
+                )),
+            });
+        };
+
+        // Least-privilege rebuild allowlist: target.allowed_tools minus
+        // `delegate`. The gate already requires this to be non-empty; re-check
+        // here so the dispatch is independently safe (an empty list would build
+        // a zero-tool sub-agent rather than silently re-admit anything).
+        let allowed_minus_delegate =
+            Self::agentic_rebuild_allowlist(&self.resolve_allowed_tools(&agent_config.risk_profile));
+        if allowed_minus_delegate.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Agent '{agent_name}' is agentic cross-profile but resolves no non-`delegate` allowed_tools"
+                )),
+            });
+        }
+
+        let overrides = AgentRunOverrides {
+            security: Some(target_policy),
+            memory: None,
+            is_subagent: true,
+        };
+        let agentic_timeout_secs = self
+            .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
+            .unwrap_or(self.delegate_config.agentic_timeout_secs);
+
+        // `agent::run` rebuilds the registry, provider, and memory for the
+        // TARGET alias from config; `provider_override`/`model_override` stay
+        // `None` so the sub-agent runs on its OWN configured model.
+        // `session_state_file = None` keeps the run ephemeral (no session file
+        // loaded or written). Boxed because `run` may transitively build a
+        // `delegate` registry, making the future type recursive.
+        let run_future = crate::agent::run(
+            (**config).clone(),
+            agent_name,
+            Some(full_prompt.to_string()),
+            None,
+            None,
+            temperature,
+            Vec::new(),
+            false,
+            None,
+            Some(allowed_minus_delegate),
+            overrides,
+        );
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(agentic_timeout_secs), Box::pin(run_future))
+                .await;
+
+        match result {
+            Ok(Ok(response)) => {
+                let rendered = if response.trim().is_empty() {
+                    "[Empty response]".to_string()
+                } else {
+                    response
+                };
+                let (provider_type, _, model, _) = self.resolve_brain(&agent_config.model_provider);
+                Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}"
                     ),
                     error: None,
                 })
@@ -4476,9 +4851,11 @@ model_provider = "zai.comment"
 
     // ── Option C: cross-profile narrowing gate ──────────────────────────────
 
-    /// caller `broad` ([git, cargo], delegation allow) → target `narrow`
-    /// ([git]) on an AGENTIC runtime profile. Narrower on commands, but the
-    /// agentic loop would reuse the caller's tool registry, so it must refuse.
+    /// caller `broad` ([git, cargo], tool-unrestricted, delegation allow) →
+    /// target `narrow` ([git], allowed_tools=[shell]) on an AGENTIC runtime
+    /// profile. Narrower on every dimension and declares an explicit allowlist,
+    /// so cross-profile AGENTIC delegation is now ALLOWED via registry-rebuild
+    /// (the sub-agent runs under the target's OWN policy, not the caller's).
     fn config_narrower_agentic_target() -> Arc<zeroclaw_config::schema::Config> {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
@@ -4532,10 +4909,14 @@ model_provider = "zai.comment"
 
     /// caller `restricted` (allowed_tools=[read_file], delegation allow) →
     /// target `wider_tools` (allowed_tools=[read_file, shell]). Same
-    /// commands/caps; ONLY the tool allowlist broadens. Both non-agentic.
+    /// commands/caps; ONLY the tool allowlist broadens. The target is AGENTIC
+    /// (the tool-authorization subset check is agentic-only — a non-agentic
+    /// toolless target has no registry to broaden).
     fn config_tool_broadening() -> Arc<zeroclaw_config::schema::Config> {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
         let mut config = Config::default();
         config.risk_profiles.insert(
             "restricted".to_string(),
@@ -4554,6 +4935,13 @@ model_provider = "zai.comment"
                 ..RiskProfileConfig::default()
             },
         );
+        config.runtime_profiles.insert(
+            "agentic_rt".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
         config.agents.insert(
             "caller".to_string(),
             AliasedAgentConfig {
@@ -4566,6 +4954,7 @@ model_provider = "zai.comment"
             "target".to_string(),
             AliasedAgentConfig {
                 risk_profile: "wider_tools".to_string(),
+                runtime_profile: "agentic_rt".to_string(),
                 model_provider: "ollama.target".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -4574,11 +4963,15 @@ model_provider = "zai.comment"
     }
 
     #[tokio::test]
-    async fn delegate_refuses_agentic_cross_profile() {
-        // An AGENTIC target on a different (even narrower) profile is refused:
-        // the in-process agentic loop reuses the caller's tool registry, so it
-        // cannot safely run under the target's policy. Narrowed agentic runs
-        // go through spawn_subagent / a shared profile.
+    async fn delegate_allows_narrower_agentic_cross_profile() {
+        // A NARROWER agentic target on a different profile that declares an
+        // explicit allowed_tools allowlist and whose own workspace is not
+        // broader than the caller's is now ALLOWED (cross-profile AGENTIC via
+        // registry-rebuild). The gate resolves the TARGET's own policy; the
+        // dispatch routes the run through `crate::agent::run` under that policy
+        // with `allowed_tools` minus `delegate` (the in-process loop, which
+        // reuses the caller's tools, is NOT used for the cross-profile case;
+        // the end-to-end rebuild is proven in the arbot smoke).
         let config = config_narrower_agentic_target();
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -4590,13 +4983,12 @@ model_provider = "zai.comment"
             .with_root_config(config.clone())
             .with_caller_alias("caller");
 
-        let err = tool
+        let resolved = tool
             .policy_for_target("target")
-            .expect_err("agentic cross-profile target must be refused");
-        let chain = format!("{err:#}");
-        assert!(
-            chain.contains("AGENTIC") && chain.contains("spawn_subagent"),
-            "expected agentic-cross-profile refusal, got: {chain}"
+            .expect("a narrower agentic cross-profile target must now be allowed");
+        assert_eq!(
+            resolved.risk_profile_name, "narrow",
+            "agentic delegate must run under the target's narrow policy, not the caller's"
         );
     }
 
@@ -4833,44 +5225,48 @@ model_provider = "zai.comment"
         );
     }
 
-    /// GAP 2 [MED] — tool / approval / sandbox dimensions. `ensure_no_escalation_beyond`
-    /// covers none of these; `target_tools_within_caller` (now both
-    /// allowed_tools arms + excluded_tools) and `target_approval_sandbox_within_caller`
-    /// close them. Each sub-case varies exactly ONE dimension to broaden the
-    /// target; one negative control proves no false refusal.
+    /// GAP 2 [MED] — tool / approval / sandbox dimensions, now scoped to the
+    /// AGENTIC path (they govern a tool registry; a non-agentic toolless target
+    /// has none — see `delegate_allows_nonagentic_target_despite_tool_approval_mismatch`).
+    /// For an agentic target `target_tools_within_caller` (allowlist +
+    /// excluded_tools) and `target_approval_sandbox_within_caller` close the
+    /// dimensions `ensure_no_escalation_beyond` does not. Each agentic target
+    /// declares an explicit allowlist (the gate requires one); each sub-case
+    /// varies exactly ONE dimension. Negative controls prove no false refusal.
     #[tokio::test]
     async fn delegate_refuses_relaxed_tool_approval_sandbox_dims() {
-        let base = RiskProfileConfig::default;
+        let base = || RiskProfileConfig {
+            allowed_tools: vec!["web_search_tool".into()],
+            ..RiskProfileConfig::default()
+        };
 
-        // (a) excluded_tools: caller denies "shell"; target denies nothing →
-        // the target re-authorizes a tool the caller excludes. REFUSED.
-        let mut caller = base();
-        caller.excluded_tools = vec!["shell".into()];
-        let err = harden_gate(caller.clone(), base(), |_| {}).expect_err(
-            "a smaller target excluded_tools set re-authorizes a caller-denied tool",
-        );
+        // (a) excluded_tools re-auth: the caller excludes `shell` from its
+        // allowlist; the agentic target lists `shell` and does NOT exclude it →
+        // target.is_tool_allowed(shell)=true > caller's false. REFUSED.
+        let caller = RiskProfileConfig {
+            allowed_tools: vec!["web_search_tool".into(), "shell".into()],
+            excluded_tools: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        };
+        let target = RiskProfileConfig {
+            allowed_tools: vec!["web_search_tool".into(), "shell".into()],
+            ..RiskProfileConfig::default()
+        };
+        let err = agentic_gate(caller, target, |_| {})
+            .expect_err("a target re-authorizing a caller-excluded tool must be refused");
         assert!(
             format!("{err:#}").contains("narrowing-only"),
-            "excluded_tools broadening: {err:#}"
-        );
-
-        // ...and a target that ALSO excludes shell (a superset denylist) is
-        // narrower → ALLOWED (no false refusal).
-        let mut target = base();
-        target.excluded_tools = vec!["shell".into(), "file_write".into()];
-        let ok = harden_gate(caller, target, |_| {});
-        assert!(
-            ok.is_ok(),
-            "a target with a superset excluded_tools set must be allowed: {ok:?}"
+            "excluded_tools re-auth: {err:#}"
         );
 
         // (b) allowed_tools (Some, None) arm: caller restricts to [read_file];
-        // the target carries no allowlist (unrestricted) → REFUSED. The
-        // pre-HARDEN (Some, Some)-only check skipped this arm.
-        let mut caller = base();
-        caller.allowed_tools = vec!["read_file".into()];
-        let err = harden_gate(caller, base(), |_| {}).expect_err(
-            "an unrestricted target under a caller that restricts allowed_tools must be refused",
+        // the agentic target carries no allowlist (unrestricted) → REFUSED.
+        let caller = RiskProfileConfig {
+            allowed_tools: vec!["read_file".into()],
+            ..RiskProfileConfig::default()
+        };
+        let err = agentic_gate(caller, RiskProfileConfig::default(), |_| {}).expect_err(
+            "an unrestricted agentic target under a caller that restricts allowed_tools must be refused",
         );
         assert!(
             format!("{err:#}").contains("narrowing-only"),
@@ -4881,7 +5277,7 @@ model_provider = "zai.comment"
         // not — bypassing an approval the caller requires. REFUSED.
         let mut target = base();
         target.auto_approve.push("shell".into());
-        let err = harden_gate(base(), target, |_| {})
+        let err = agentic_gate(base(), target, |_| {})
             .expect_err("a target auto-approving a tool the caller does not must be refused");
         assert!(
             format!("{err:#}").contains("auto-approves"),
@@ -4892,7 +5288,7 @@ model_provider = "zai.comment"
         // target drops it. REFUSED.
         let mut caller = base();
         caller.always_ask = vec!["file_write".into()];
-        let err = harden_gate(caller, base(), |_| {})
+        let err = agentic_gate(caller, base(), |_| {})
             .expect_err("a target dropping an always_ask the caller requires must be refused");
         assert!(
             format!("{err:#}").contains("always-ask"),
@@ -4902,15 +5298,13 @@ model_provider = "zai.comment"
         // (e) sandbox: the caller runs sandboxed via the COMMON active-by-
         // default regime (backend set, `sandbox_enabled` unset → None →
         // effectively sandboxed); the target sets `sandbox_enabled = false`
-        // → NoopSandbox, strictly unsandboxed. REFUSED. The pre-fix
-        // `caller.sandbox_enabled == Some(true)` guard MISSED this (the
-        // caller's flag is None), which the adversarial review caught.
+        // → NoopSandbox, strictly unsandboxed. REFUSED.
         let mut caller = base();
         caller.sandbox_backend = Some("firejail".into());
         let mut target = base();
         target.sandbox_backend = Some("firejail".into());
         target.sandbox_enabled = Some(false);
-        let err = harden_gate(caller, target, |_| {})
+        let err = agentic_gate(caller, target, |_| {})
             .expect_err("a target disabling the sandbox under an active-by-default caller must be refused");
         assert!(
             format!("{err:#}").contains("unsandboxed"),
@@ -4923,42 +5317,80 @@ model_provider = "zai.comment"
         caller.sandbox_backend = Some("firejail".into());
         let mut target = base();
         target.sandbox_backend = Some("none".into());
-        let err = harden_gate(caller, target, |_| {})
+        let err = agentic_gate(caller, target, |_| {})
             .expect_err("a target with sandbox_backend=none under a sandboxed caller must be refused");
         assert!(
             format!("{err:#}").contains("unsandboxed"),
             "sandbox backend=none: {err:#}"
         );
 
-        // (e3) NO false refusal: `firejail_args` is runtime-inert (the runtime
-        // hard-codes the firejail flag set and never forwards policy
-        // firejail_args), so a target with DIFFERENT firejail_args produces a
-        // byte-identical sandbox and must NOT be refused. Deliberate
-        // non-comparison; becomes an equality check once the runtime forwards
-        // firejail_args (the arg space is non-monotone). Guards against the
-        // over-strict equality clause the adversarial re-verify flagged.
+        // (e3) NO false refusal: `firejail_args` is runtime-inert, so a target
+        // with DIFFERENT firejail_args produces a byte-identical sandbox →
+        // ALLOWED. Guards the over-strict equality clause the HARDEN re-verify
+        // flagged.
         let mut caller = base();
         caller.sandbox_backend = Some("firejail".into());
         caller.firejail_args = vec!["--net=none".into()];
         let mut target = base();
         target.sandbox_backend = Some("firejail".into());
         target.firejail_args = vec!["--net=none".into(), "--noprofile".into()];
-        let ok = harden_gate(caller, target, |_| {});
         assert!(
-            ok.is_ok(),
-            "differing but runtime-inert firejail_args must not false-refuse: {ok:?}"
+            agentic_gate(caller, target, |_| {}).is_ok(),
+            "differing but runtime-inert firejail_args must not false-refuse"
         );
 
-        // (e4) NO false refusal: identical sandbox config (same backend, both
-        // active-by-default) is narrower-or-equal → ALLOWED.
+        // (e4) NO false refusal: identical sandbox config → ALLOWED.
         let mut caller = base();
         caller.sandbox_backend = Some("firejail".into());
         let mut target = base();
         target.sandbox_backend = Some("firejail".into());
-        let ok = harden_gate(caller, target, |_| {});
         assert!(
-            ok.is_ok(),
-            "identical sandbox config must be allowed (no false refusal): {ok:?}"
+            agentic_gate(caller, target, |_| {}).is_ok(),
+            "identical sandbox config must be allowed (no false refusal)"
+        );
+
+        // (f) NO false refusal: a strictly NARROWER allowlist (subset) → ALLOWED.
+        let caller = RiskProfileConfig {
+            allowed_tools: vec!["web_search_tool".into(), "shell".into()],
+            ..RiskProfileConfig::default()
+        };
+        assert!(
+            agentic_gate(caller, base(), |_| {}).is_ok(),
+            "a narrower allowlist must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_allows_nonagentic_target_despite_tool_approval_mismatch() {
+        // A NON-AGENTIC delegate runs a single toolless `chat()` (tools: None,
+        // no tool-call loop) — no tool registry, no approval prompts, no
+        // sandboxed execution — so the tool / approval / sandbox subset checks
+        // are runtime-INERT for it and are deliberately skipped (only the grant
+        // ceiling `ensure_no_escalation_beyond` applies). This restores the
+        // toolless delegate roster: arbot's 8 non-agentic delegates have empty
+        // `allowed_tools` (unrestricted) and inherit a broad default
+        // `auto_approve`, which — under a router caller that narrows BOTH its own
+        // allowlist and auto_approve to `[delegate]` — the HARDEN tool/approval
+        // checks would otherwise false-refuse. Here the non-agentic target is
+        // unrestricted on tools AND broader on auto_approve, yet ALLOWED.
+        let caller = RiskProfileConfig {
+            allowed_tools: vec!["delegate".into()],
+            auto_approve: vec!["delegate".into()],
+            ..RiskProfileConfig::default()
+        };
+        let target = RiskProfileConfig {
+            // empty allowed_tools (None / unrestricted) + a broad auto_approve —
+            // the live-roster shape that the agentic-only scoping must not refuse.
+            auto_approve: vec!["file_read".into(), "shell".into(), "web_search_tool".into()],
+            ..RiskProfileConfig::default()
+        };
+        // `harden_gate` places the target on a NON-AGENTIC runtime profile.
+        let resolved = harden_gate(caller, target, |_| {}).expect(
+            "a toolless non-agentic target must be allowed despite a tool/auto_approve mismatch",
+        );
+        assert_eq!(
+            resolved.risk_profile_name, "t_rp",
+            "non-agentic delegate runs under its own policy"
         );
     }
 
@@ -4990,5 +5422,496 @@ model_provider = "zai.comment"
         assert!(tool.resolve_agentic("agentic_rt"));
         assert!(!tool.resolve_agentic("   "));
         assert!(!tool.resolve_agentic("unknown_rt"));
+    }
+
+    // ── AGENTIC: cross-profile agentic delegation via registry-rebuild ──────
+    //
+    // The cross-profile AGENTIC case is no longer refused outright. The gate
+    // ALLOWS a narrower agentic target that (i) is no broader on every
+    // `ensure_no_escalation_beyond` / tool / approval / sandbox dimension,
+    // (ii) has its own workspace no broader than (not containing) the caller's,
+    // and (iii) declares an explicit non-`delegate` allowed_tools allowlist. The
+    // dispatch then runs it through `crate::agent::run` under the TARGET's
+    // policy with `allowed_tools` minus `delegate` (registry rebuilt; no caller
+    // tools; no re-delegation). These tests cover the GATE decision + helpers;
+    // the actual rebuilt run is proven in the arbot smoke (needs a live
+    // provider).
+
+    /// Like `harden_gate`, but the TARGET sits on an AGENTIC runtime profile so
+    /// the cross-profile AGENTIC branch of the gate is exercised. The caller
+    /// permits delegation. `mutate_target` can adjust the target agent.
+    fn agentic_gate(
+        caller_rp: RiskProfileConfig,
+        target_rp: RiskProfileConfig,
+        mutate_target: impl FnOnce(&mut AliasedAgentConfig),
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+        let mut config = Config::default();
+        let mut caller_rp = caller_rp;
+        caller_rp.delegation_policy = DelegationPolicy {
+            mode: DelegationMode::Allow,
+        };
+        config.risk_profiles.insert("c_rp".to_string(), caller_rp);
+        config.risk_profiles.insert("t_rp".to_string(), target_rp);
+        config.runtime_profiles.insert(
+            "agentic_rt".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "c_rp".to_string(),
+                model_provider: "ollama.caller".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let mut target = AliasedAgentConfig {
+            risk_profile: "t_rp".to_string(),
+            runtime_profile: "agentic_rt".to_string(),
+            model_provider: "ollama.target".into(),
+            ..AliasedAgentConfig::default()
+        };
+        mutate_target(&mut target);
+        config.agents.insert("target".to_string(), target);
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            agents.insert(name.clone(), agent.clone());
+        }
+        DelegateTool::new(agents, None, caller_policy)
+            .with_root_config(config)
+            .with_caller_alias("caller")
+            .policy_for_target("target")
+    }
+
+    /// Cross-profile AGENTIC gate where caller and target have explicit (and by
+    /// default distinct, non-nested) `workspace.path`s, so the agentic
+    /// own-workspace breadth check can be exercised deterministically without
+    /// depending on the install-root-derived default paths.
+    fn agentic_ws_gate(caller_ws: &str, target_ws: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
+        use std::path::PathBuf;
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "c_rp".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "t_rp".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["web_search_tool".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic_rt".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let mut caller = AliasedAgentConfig {
+            risk_profile: "c_rp".to_string(),
+            model_provider: "ollama.caller".into(),
+            ..AliasedAgentConfig::default()
+        };
+        caller.workspace.path = Some(PathBuf::from(caller_ws));
+        config.agents.insert("caller".to_string(), caller);
+        let mut target = AliasedAgentConfig {
+            risk_profile: "t_rp".to_string(),
+            runtime_profile: "agentic_rt".to_string(),
+            model_provider: "ollama.target".into(),
+            ..AliasedAgentConfig::default()
+        };
+        target.workspace.path = Some(PathBuf::from(target_ws));
+        config.agents.insert("target".to_string(), target);
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            agents.insert(name.clone(), agent.clone());
+        }
+        DelegateTool::new(agents, None, caller_policy)
+            .with_root_config(config)
+            .with_caller_alias("caller")
+            .policy_for_target("target")
+    }
+
+    #[tokio::test]
+    async fn delegate_allows_narrower_agentic_with_explicit_allowlist() {
+        // arbot research_assistant shape: caller restricted to
+        // [delegate, web_search_tool]; agentic target restricted to
+        // [web_search_tool] (a subset). Cross-profile AGENTIC is ALLOWED via
+        // registry-rebuild; the resolved policy is the TARGET's.
+        let caller = RiskProfileConfig {
+            allowed_tools: vec!["delegate".into(), "web_search_tool".into()],
+            ..RiskProfileConfig::default()
+        };
+        let target = RiskProfileConfig {
+            allowed_tools: vec!["web_search_tool".into()],
+            ..RiskProfileConfig::default()
+        };
+        let resolved = agentic_gate(caller, target, |_| {})
+            .expect("narrower agentic target with explicit allowlist must be allowed");
+        assert_eq!(
+            resolved.risk_profile_name, "t_rp",
+            "agentic delegate must run under the target's own policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_refuses_agentic_cross_profile_without_explicit_allowlist() {
+        // A tool-unrestricted agentic target (empty allowed_tools) cannot be
+        // expressed as a minimal least-privilege rebuild (the overlay would be
+        // empty, or would have to re-admit `delegate`). Both caller and target
+        // are tool-unrestricted, so the tool-subset check passes; the agentic
+        // branch refuses on the explicit-allowlist requirement.
+        let err =
+            agentic_gate(RiskProfileConfig::default(), RiskProfileConfig::default(), |_| {})
+                .expect_err("an agentic cross-profile target without an explicit allowlist must be refused");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("explicit tool allowlist"),
+            "expected explicit-allowlist refusal, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_refuses_broader_agentic_target_cross_profile() {
+        // Broadness on a normal grant dimension is still caught on the agentic
+        // path (by ensure_no_escalation_beyond, before the agentic-specific
+        // checks): a target with a command the caller lacks is refused.
+        let caller = RiskProfileConfig {
+            allowed_commands: vec!["git".into()],
+            allowed_tools: vec!["web_search_tool".into()],
+            ..RiskProfileConfig::default()
+        };
+        let target = RiskProfileConfig {
+            allowed_commands: vec!["git".into(), "rm".into()],
+            allowed_tools: vec!["web_search_tool".into()],
+            ..RiskProfileConfig::default()
+        };
+        let err = agentic_gate(caller, target, |_| {})
+            .expect_err("a broader agentic target must still be refused");
+        assert!(
+            format!("{err:#}").contains("narrowing-only"),
+            "expected narrowing refusal for broader agentic target: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_refuses_unrestricted_filesystem_agentic_target() {
+        // An agentic target with unrestricted_filesystem (workspace_only=false)
+        // is refused upstream by ensure_no_escalation_beyond
+        // (WorkspaceOnlyDisabledByChild) before the agentic ws-breadth check.
+        let target = RiskProfileConfig {
+            allowed_tools: vec!["web_search_tool".into()],
+            ..RiskProfileConfig::default()
+        };
+        let err = agentic_gate(RiskProfileConfig::default(), target, |t| {
+            t.workspace.unrestricted_filesystem = true;
+        })
+        .expect_err("an unrestricted-filesystem agentic target must be refused");
+        assert!(
+            format!("{err:#}").contains("narrowing-only"),
+            "expected narrowing refusal for unrestricted agentic target: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_agentic_own_workspace_breadth_gate() {
+        // (a) target's own workspace is a STRICT ANCESTOR of (contains) the
+        // caller's → its FS-capable tools would reach a SUPERSET of the
+        // caller's region → REFUSED.
+        let err = agentic_ws_gate("/srv/zc/agents/caller/ws", "/srv/zc/agents")
+            .expect_err("an agentic target whose own workspace contains the caller's must be refused");
+        assert!(
+            format!("{err:#}").contains("broader than"),
+            "expected workspace-breadth refusal, got: {err:#}"
+        );
+
+        // (b) NO false refusal: a DISTINCT, non-nested SIBLING workspace is not
+        // an escalation (each agent's own workspace is its private sandbox —
+        // the exact false-positive HARDEN's neutralization avoids).
+        let resolved = agentic_ws_gate("/srv/zc/agents/caller/ws", "/srv/zc/agents/target/ws")
+            .expect("a distinct non-nested sibling workspace must NOT be refused");
+        assert_eq!(resolved.risk_profile_name, "t_rp");
+
+        // (c) NO false refusal: the target's own workspace is a DESCENDANT
+        // (narrower) of the caller's → allowed.
+        let resolved = agentic_ws_gate("/srv/zc/shared", "/srv/zc/shared/sub")
+            .expect("a target workspace nested under the caller's must be allowed");
+        assert_eq!(resolved.risk_profile_name, "t_rp");
+
+        // (d) NO false refusal: identical workspace paths → equal reach →
+        // allowed.
+        let resolved = agentic_ws_gate("/srv/zc/same", "/srv/zc/same")
+            .expect("identical workspaces must be allowed");
+        assert_eq!(resolved.risk_profile_name, "t_rp");
+    }
+
+    #[test]
+    fn parameters_schema_advertises_narrower_agentic_target() {
+        // The roster mirrors the gate: a narrower agentic target with an
+        // explicit allowlist is now reachable, so it must be advertised.
+        let config = config_narrower_agentic_target();
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            desc.contains("target"),
+            "narrower agentic target must be advertised: {desc}"
+        );
+    }
+
+    #[test]
+    fn agentic_rebuild_allowlist_strips_delegate_and_blanks() {
+        let got = DelegateTool::agentic_rebuild_allowlist(&[
+            "web_search_tool".into(),
+            "  ".into(),
+            "delegate".into(),
+            " read_file ".into(),
+        ]);
+        assert_eq!(
+            got,
+            vec!["web_search_tool".to_string(), "read_file".to_string()],
+            "rebuild allowlist must trim, drop blanks, and strip `delegate`"
+        );
+        // A target whose only tool is `delegate` yields an empty rebuild set
+        // (the gate refuses such a target — no re-delegation, no zero-tool run).
+        assert!(
+            DelegateTool::agentic_rebuild_allowlist(&["delegate".into()]).is_empty(),
+            "a delegate-only allowlist must rebuild to the empty set"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_jail_resolves_symlink_to_canonical_destination() {
+        // The jail the runtime enforces is the CANONICAL destination of a
+        // resolvable symlink — not its literal path — while a not-yet-created
+        // path falls back to its literal form.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let real = root_path.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        let link = root_path.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink link -> real");
+        // A resolvable symlink is judged by its canonical destination.
+        assert_eq!(DelegateTool::workspace_jail(&link), real);
+        // A path that does not exist falls back to its literal form.
+        let ghost = root_path.join("does").join("not").join("exist");
+        assert_eq!(DelegateTool::workspace_jail(&ghost), ghost);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegate_agentic_refuses_symlinked_workspace_to_broad_ancestor() {
+        // BLOCKER regression (HIGH, audit `confirmed_real_holes[0]`): the
+        // target's `workspace.path` is LITERALLY nested inside the caller's
+        // workspace but is a real on-disk SYMLINK resolving to a broad ANCESTOR
+        // (the install root holding the caller's workspace). At runtime the
+        // sub-agent's file tools canonicalize `workspace_dir`, so its effective
+        // FS jail becomes that broad destination — a strict SUPERSET of the
+        // caller's region. The prior canonical-OR-literal `path_within` was
+        // bypassed by exactly this shape (the literal fallback read the symlink
+        // as "contained" in the caller → gate ALLOWED). The canonical-jail
+        // comparison judges the symlink by its canonical destination → REFUSES.
+        // (Unlike the existing agentic_ws_gate cases, which use non-existent
+        // /srv/zc paths that never hit the canonicalize branch, this uses real
+        // on-disk dirs + a real symlink so the bypass is actually exercised.)
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        // Caller's real workspace lives under the broad root.
+        let caller_ws = root_path.join("agents").join("caller").join("ws");
+        std::fs::create_dir_all(&caller_ws).expect("mkdir caller ws");
+        // Plant the symlink INSIDE the caller's own (writable) workspace,
+        // pointing UP to the broad root that contains caller_ws — the
+        // self-escalation vector.
+        let escape = caller_ws.join("escape");
+        std::os::unix::fs::symlink(&root_path, &escape).expect("symlink escape -> root");
+
+        let err = agentic_ws_gate(
+            caller_ws.to_str().expect("utf8 caller"),
+            escape.to_str().expect("utf8 escape"),
+        )
+        .expect_err(
+            "an agentic target whose symlinked workspace resolves to a broad ancestor must be refused",
+        );
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("broader than"),
+            "expected workspace-breadth refusal for the symlink bypass, got: {chain}"
+        );
+
+        // Positive control: a genuine real-on-disk DESCENDANT workspace
+        // (narrower) under the same caller is NOT an escalation → ALLOWED.
+        let nested = caller_ws.join("sub");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        let resolved = agentic_ws_gate(
+            caller_ws.to_str().expect("utf8 caller"),
+            nested.to_str().expect("utf8 nested"),
+        )
+        .expect("a real on-disk descendant workspace must be allowed");
+        assert_eq!(resolved.risk_profile_name, "t_rp");
+    }
+
+    /// Cross-profile AGENTIC gate where the target is granted `workspace.access`
+    /// to a sibling agent whose own `workspace.path` is `sibling_ws`, and the
+    /// caller's risk profile grants `caller_root`. Exercises the symlink-breadth
+    /// bypass on the `workspace.access` FS dimension — the SECOND filesystem
+    /// dimension (besides an agent's own `workspace_dir`) that an agentic target
+    /// runs FS tools against. `profile_grants` re-applies the sibling's
+    /// `workspace_dir` into the target's `allowed_roots`, which
+    /// `ensure_no_escalation_beyond` compares via the (now canonical-jail)
+    /// `path_contains`.
+    fn agentic_access_gate(
+        caller_root: &str,
+        sibling_ws: &str,
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
+        use std::path::PathBuf;
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::multi_agent::{AccessMode, AgentAlias};
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "c_rp".to_string(),
+            RiskProfileConfig {
+                allowed_roots: vec![caller_root.to_string()],
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "t_rp".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_write".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("s_rp".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "agentic_rt".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "c_rp".to_string(),
+                model_provider: "ollama.caller".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let mut sibling = AliasedAgentConfig {
+            risk_profile: "s_rp".to_string(),
+            model_provider: "ollama.sib".into(),
+            ..AliasedAgentConfig::default()
+        };
+        sibling.workspace.path = Some(PathBuf::from(sibling_ws));
+        config.agents.insert("evil_sib".to_string(), sibling);
+        let mut target = AliasedAgentConfig {
+            risk_profile: "t_rp".to_string(),
+            runtime_profile: "agentic_rt".to_string(),
+            model_provider: "ollama.target".into(),
+            ..AliasedAgentConfig::default()
+        };
+        target
+            .workspace
+            .access
+            .insert(AgentAlias::new("evil_sib"), AccessMode::ReadWrite);
+        config.agents.insert("target".to_string(), target);
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            agents.insert(name.clone(), agent.clone());
+        }
+        DelegateTool::new(agents, None, caller_policy)
+            .with_root_config(config)
+            .with_caller_alias("caller")
+            .policy_for_target("target")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegate_agentic_refuses_symlinked_workspace_access_to_broad_ancestor() {
+        // BLOCKER regression (HIGH, surfaced by the AGFIX adversarial review —
+        // the workspace.access FS dimension the original audit overlooked). FIX 1's
+        // Part-1 check covers only an agent's OWN workspace_dir. A cross-agent
+        // `workspace.access` grant re-applies a SIBLING's workspace_dir into the
+        // target's allowed_roots (profile_grants), compared by
+        // `ensure_no_escalation_beyond`'s `path_contains`. With the OLD
+        // canonical-OR-literal `path_contains`, a sibling whose workspace.path is
+        // a real on-disk SYMLINK literally nested under a caller allowed_root but
+        // resolving to a broad ANCESTOR passed the gate, yet the rebuilt agentic
+        // sub-agent's FS jail followed the symlink to that ancestor (a superset of
+        // the caller's region). The canonical-jail `path_contains` judges the
+        // symlink by its destination → REFUSES.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().canonicalize().expect("canonicalize root");
+        let caller_root = root_path.join("shared");
+        std::fs::create_dir_all(&caller_root).expect("mkdir caller root");
+        // Sibling workspace literally nested under the caller's root, but a
+        // symlink UP to the broad tempdir root that contains caller_root.
+        let escape = caller_root.join("evil");
+        std::os::unix::fs::symlink(&root_path, &escape).expect("symlink evil -> root");
+
+        let err = agentic_access_gate(
+            caller_root.to_str().expect("utf8 caller root"),
+            escape.to_str().expect("utf8 escape"),
+        )
+        .expect_err(
+            "a symlinked workspace.access sibling resolving to a broad ancestor must be refused",
+        );
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("escalate beyond"),
+            "expected an escalation refusal for the workspace.access symlink bypass, got: {chain}"
+        );
+
+        // Positive control: a sibling workspace that is a symlink resolving to a
+        // dir genuinely UNDER the caller's root is narrower → ALLOWED (the
+        // canonical check must not false-refuse an inward-resolving symlink).
+        let inner = caller_root.join("inner");
+        std::fs::create_dir_all(&inner).expect("mkdir inner");
+        let inward = caller_root.join("inward");
+        std::os::unix::fs::symlink(&inner, &inward).expect("symlink inward -> inner");
+        let resolved = agentic_access_gate(
+            caller_root.to_str().expect("utf8 caller root"),
+            inward.to_str().expect("utf8 inward"),
+        )
+        .expect("a sibling workspace resolving under the caller's root must be allowed");
+        assert_eq!(resolved.risk_profile_name, "t_rp");
     }
 }
