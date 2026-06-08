@@ -1367,6 +1367,181 @@ pub fn create_resilient_model_provider_from_ref(
     }
 }
 
+/// Fallback-aware variant of [`create_resilient_model_provider_for_alias`].
+/// When `fallback_refs` is non-empty, builds the primary provider PLUS one
+/// `ModelProvider` per fallback alias — each from its OWN typed config so
+/// per-alias `base.uri` / `base.api_key` / `base.model` overrides take
+/// effect (RFC #5890 patch ④ Gap A). The aligned `Vec<Option<String>>` of
+/// per-provider model strings is installed via
+/// `ReliableModelProvider::with_provider_models`. Empty `fallback_refs`
+/// delegates to the legacy single-provider builder.
+pub fn create_resilient_model_provider_for_alias_with_fallback(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    fallback_refs: &[String],
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    if fallback_refs.is_empty() {
+        return create_resilient_model_provider_for_alias(
+            config,
+            family,
+            alias,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        );
+    }
+    // Gap A: per-alias provider construction. Each entry in the fallback chain
+    // gets its OWN ModelProvider instance built from its own typed config — so
+    // overrides on `base.uri`, `base.api_key`, etc. on each fallback alias are
+    // honoured. The v1 model_fallbacks HashMap path (single primary provider,
+    // model strings only) only swapped the model string per attempt, which
+    // meant URI overrides leaked from the primary to every fallback. Test 3
+    // exposed this concretely: setting primary.uri = http://127.0.0.1:9 caused
+    // the alt_turbo and alt_47 fallbacks to also hit 127.0.0.1:9.
+    let mut providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
+    let mut chain_models: Vec<Option<String>> = Vec::new();
+
+    // Primary alias
+    let primary_provider =
+        create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
+    let primary_entry = config.providers.models.find(family, alias).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "primary alias {}.{} has no [providers.models.{}.{}] block",
+            family, alias, family, alias,
+        ))
+    })?;
+    let primary_model = primary_entry.model.clone().ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "primary alias {}.{} has no `model` field set",
+            family, alias,
+        ))
+    })?;
+    providers.push((family.to_string(), primary_provider));
+    chain_models.push(Some(primary_model));
+
+    // Fallback aliases — each gets its own provider+model from its typed
+    // config block. api_key=None and api_url=None so the per-alias typed
+    // config's own fields drive credentials/endpoint (otherwise this would
+    // inherit the primary's again and Gap A wouldn't be fixed).
+    for fb_ref in fallback_refs {
+        let (fb_family, fb_alias) = fb_ref.split_once('.').ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "fallback ref `{}` must be dotted (`<family>.<alias>`); bare names \
+                 (e.g. `\"zai\"`) aren't supported because they lack the typed alias \
+                 context needed to resolve the fallback model string",
+                fb_ref,
+            ))
+        })?;
+        if fb_family != family {
+            anyhow::bail!(
+                "cross-family fallback not supported in v1 (primary={}.{}  fallback={}.{}); \
+                 RFC #5890 same-family-only at this revision — cross-family is a follow-up \
+                 (each family's request/response schema would need translating; Gap A's \
+                 per-alias construction is a prerequisite but not sufficient on its own)",
+                family,
+                alias,
+                fb_family,
+                fb_alias,
+            );
+        }
+        let fb_entry = config
+            .providers
+            .models
+            .find(fb_family, fb_alias)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "fallback alias {}.{} has no [providers.models.{}.{}] block",
+                    fb_family, fb_alias, fb_family, fb_alias,
+                ))
+            })?;
+        let fb_model = fb_entry.model.clone().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "fallback alias {}.{} has no `model` field set",
+                fb_family, fb_alias,
+            ))
+        })?;
+        // Thread the fallback alias's own api_key + uri override into the
+        // factory. Passing None lets `create_model_provider_inner` resolve
+        // credentials via env-var lookup, NOT the typed config's `base.api_key`
+        // field — so a fallback alias with its own api_key would fail
+        // authentication. Live validation caught this: bogus URI override on
+        // primary correctly routed fallbacks to the family endpoint, but they
+        // got 401 because their per-alias api_key wasn't applied.
+        let fb_api_key = fb_entry.api_key.as_deref();
+        let fb_api_url = fb_entry.uri.as_deref();
+        let fb_provider = create_model_provider_inner(
+            Some(config),
+            fb_family,
+            fb_alias,
+            fb_api_key,
+            fb_api_url,
+            options,
+        )?;
+        providers.push((fb_family.to_string(), fb_provider));
+        chain_models.push(Some(fb_model));
+    }
+
+    let reliable = ReliableModelProvider::new(
+        alias,
+        providers,
+        reliability.provider_retries,
+        reliability.provider_backoff_ms,
+    )
+    .with_api_keys(reliability.api_keys.clone())
+    .with_provider_models(chain_models);
+
+    Ok(Box::new(reliable))
+}
+
+/// Dispatcher for fallback-aware resilient builder. Dotted refs go through
+/// `_for_alias_with_fallback`; bare names (no typed alias context) cannot
+/// resolve fallback model strings, so they fall back to the legacy builder
+/// (and any non-empty fallback chain is rejected).
+pub fn create_resilient_model_provider_from_ref_with_fallback(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+    fallback_refs: &[String],
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    if fallback_refs.is_empty() {
+        return create_resilient_model_provider_from_ref(
+            config,
+            name,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        );
+    }
+    match name.split_once('.') {
+        Some((family, alias)) => create_resilient_model_provider_for_alias_with_fallback(
+            config,
+            family,
+            alias,
+            fallback_refs,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        ),
+        None => anyhow::bail!(
+            "model_provider_fallback configured on agent with bare primary `{}` — \
+             fallback chains require a dotted primary (e.g. `\"<family>.<alias>\"`) so the \
+             builder can resolve each fallback alias's model string",
+            name
+        ),
+    }
+}
+
 /// Build a router fronted by `primary_name` plus one provider per unique
 /// `model_routes` entry. Each dotted `<family>.<alias>` name resolves
 /// through the typed `[model_providers.<family>.<alias>]` config (endpoint

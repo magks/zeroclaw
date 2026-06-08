@@ -3480,17 +3480,41 @@ pub async fn run(
         // (e.g. an xai key) to a different provider family that doesn't expect it.
         let (initial_api_key, initial_uri) =
             api_key_and_uri_for_provider(&config, &provider_name, agent_model_provider);
+        // Patch ④: per-agent fallback chain (RFC #5890). When the agent
+        // declares `model_provider_fallback`, route through the fallback-aware
+        // builder which constructs one ModelProvider per alias (each with its
+        // own typed config) inside a `ReliableModelProvider`. This bypasses
+        // `model_routes`-based routing — the two features are orthogonal
+        // (routes = task-hint routing, fallback = failure-failover). If both
+        // are configured the fallback path wins; in practice an agent
+        // typically uses one or the other.
+        //
+        // This is the live CLI entry point (`zeroclaw agent ...` → `agent::run`
+        // re-exports `loop_::run`); the dormant `agent.rs::Agent::from_config`
+        // path is reached by ACP/daemon callers.
         let mut model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
-                &provider_name,
-                initial_api_key.as_deref(),
-                initial_uri.as_deref(),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+            if !agent.model_provider_fallback.is_empty() {
+                zeroclaw_providers::create_resilient_model_provider_from_ref_with_fallback(
+                    &config,
+                    &provider_name,
+                    &agent.model_provider_fallback,
+                    initial_api_key.as_deref(),
+                    initial_uri.as_deref(),
+                    &config.reliability,
+                    &provider_runtime_options,
+                )?
+            } else {
+                zeroclaw_providers::create_routed_model_provider_with_options(
+                    &config,
+                    &provider_name,
+                    initial_api_key.as_deref(),
+                    initial_uri.as_deref(),
+                    &config.reliability,
+                    &config.model_routes,
+                    &model_name,
+                    &provider_runtime_options,
+                )?
+            };
 
         let model_switch_callback = get_model_switch_state();
 
