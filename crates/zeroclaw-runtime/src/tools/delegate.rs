@@ -3961,4 +3961,134 @@ mod tests {
             "expected same-profile rejection, got: {chain}"
         );
     }
+
+    // ── Per-delegate provider-endpoint resolution (T7 misroute regression) ──
+    //
+    // Before the fix, every delegate reused the single inherited
+    // `provider_runtime_options` (the root config's FIRST model provider), so an
+    // ollama delegate posted to whatever endpoint the first provider declared. On
+    // a host where a Z.AI alias sorts first with an explicit `uri`, ollama
+    // delegates POSTed the local model to Z.AI and got `400 {"code":"1211"}`.
+    // These tests pin the per-delegate-alias re-resolution.
+    // (The magks originals also asserted the pre-fix leak via
+    // `provider_runtime_options_from_config`, which beta-2 removed; those sanity
+    // blocks are dropped here — the real regression assertions stand alone.)
+
+    /// newmoon-shape config: a `zai` alias (explicit z.ai uri) sorts before
+    /// `ollama` in the family-slot order, so it is `first_model_provider()`.
+    const NEWMOON_SHAPE_TOML: &str = r#"
+[providers.models.zai.orch]
+uri = "https://api.z.ai/api/coding/paas/v4"
+model = "glm-5.1"
+
+[providers.models.ollama.local]
+uri = "http://127.0.0.1:11434/v1"
+model = "qwen3.5:9b"
+
+[agents.worker]
+model_provider = "ollama.local"
+
+[agents.zai_worker]
+model_provider = "zai.orch"
+"#;
+
+    /// arbot-shape config: NO provider sets an explicit `uri`; the earliest
+    /// non-empty family (`anthropic`) is `first_model_provider()` with no uri.
+    const ARBOT_SHAPE_TOML: &str = r#"
+[providers.models.anthropic.default]
+model = "claude-opus-4-20250514"
+
+[providers.models.zai.comment]
+model = "glm-5-turbo"
+
+[providers.models.ollama.tag]
+model = "qwen3.5:9b"
+
+[agents.tagger]
+model_provider = "ollama.tag"
+
+[agents.commenter]
+model_provider = "zai.comment"
+"#;
+
+    #[test]
+    fn delegate_ollama_resolves_own_endpoint_not_first_provider_url() {
+        let config: Config = toml::from_str(NEWMOON_SHAPE_TOML).unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_root_config(Arc::new(config));
+
+        // The fix: the ollama delegate targets the ollama endpoint, NOT z.ai.
+        assert_eq!(
+            tool.resolve_delegate_provider_options("ollama.local")
+                .provider_api_url
+                .as_deref(),
+            Some("http://127.0.0.1:11434/v1"),
+            "ollama delegate must not inherit the first provider's z.ai url"
+        );
+
+        // A zai delegate still keeps its own (coding-plan, billing-safe) uri.
+        assert_eq!(
+            tool.resolve_delegate_provider_options("zai.orch")
+                .provider_api_url
+                .as_deref(),
+            Some("https://api.z.ai/api/coding/paas/v4"),
+        );
+    }
+
+    #[test]
+    fn delegate_no_uri_config_falls_through_to_family_default() {
+        // arbot-shape: no explicit uris anywhere. Must NOT regress — the ollama
+        // delegate keeps `provider_api_url == None` (factory localhost default),
+        // the zai delegate resolves to the zai family default.
+        let config: Config = toml::from_str(ARBOT_SHAPE_TOML).unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_root_config(Arc::new(config));
+
+        // ollama's FamilyEndpoint::endpoint_uri() is None → stays None →
+        // create_model_provider falls back to the localhost:11434/v1 default.
+        assert_eq!(
+            tool.resolve_delegate_provider_options("ollama.tag")
+                .provider_api_url,
+            None,
+            "no-uri ollama delegate must stay None (factory default) — arbot parity"
+        );
+        // zai's endpoint default (Global) IS the coding-plan endpoint.
+        assert_eq!(
+            tool.resolve_delegate_provider_options("zai.comment")
+                .provider_api_url
+                .as_deref(),
+            Some("https://api.z.ai/api/coding/paas/v4"),
+        );
+    }
+
+    #[test]
+    fn delegate_options_fall_back_to_inherited_without_root_config() {
+        // Legacy unit-test constructors / bare aliases must reuse the inherited
+        // options unchanged (no root_config to re-resolve against).
+        let inherited = zeroclaw_providers::ModelProviderRuntimeOptions {
+            provider_api_url: Some("http://inherited.example/v1".to_string()),
+            ..Default::default()
+        };
+        let tool = DelegateTool::new_with_options(
+            HashMap::new(),
+            None,
+            test_security(),
+            inherited.clone(),
+        );
+
+        assert_eq!(
+            tool.resolve_delegate_provider_options("ollama.local")
+                .provider_api_url,
+            inherited.provider_api_url,
+            "no root_config → inherited options"
+        );
+        assert_eq!(
+            tool.resolve_delegate_provider_options("ollama")
+                .provider_api_url,
+            inherited.provider_api_url,
+            "bare alias (no family.alias) → inherited options"
+        );
+    }
 }
