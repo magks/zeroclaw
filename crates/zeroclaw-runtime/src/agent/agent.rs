@@ -1262,17 +1262,38 @@ impl Agent {
             provider_alias,
         );
 
+        // Patch ④: per-agent fallback chain (RFC #5890). When the agent
+        // declares `model_provider_fallback`, route through the fallback-aware
+        // builder which installs a `model_fallbacks` chain into the
+        // `ReliableModelProvider`. This bypasses `model_routes`-based routing —
+        // the two features are orthogonal (routes = task-hint routing, fallback
+        // = failure-failover); if both are configured the fallback path wins.
+        // This is the dormant ACP/daemon serving path; the live CLI path
+        // (`loop_::run`) carries the equivalent gate already — re-applied here
+        // for parity.
         let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+            if !agent_cfg.model_provider_fallback.is_empty() {
+                zeroclaw_providers::create_resilient_model_provider_from_ref_with_fallback(
+                    config,
+                    &provider_ref,
+                    &agent_cfg.model_provider_fallback,
+                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                    &config.reliability,
+                    &provider_runtime_options,
+                )?
+            } else {
+                zeroclaw_providers::create_routed_model_provider_with_options(
+                    config,
+                    &provider_ref,
+                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                    &config.reliability,
+                    &config.model_routes,
+                    &model_name,
+                    &provider_runtime_options,
+                )?
+            };
 
         let dispatcher_choice = agent_cfg.resolved.tool_dispatcher.as_str();
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
@@ -2069,6 +2090,11 @@ impl Agent {
                         error_message: None,
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
+                        // ACP/RPC streaming serving surface (beta-2 #6955 native
+                        // obs); not the loop_/delegate emission path that owns
+                        // the fallback scope, so configured == served here.
+                        actual_provider: None,
+                        actual_model: None,
                     });
                     resp
                 }
@@ -2082,6 +2108,8 @@ impl Agent {
                         error_message: Some(safe_error),
                         input_tokens: None,
                         output_tokens: None,
+                        actual_provider: None,
+                        actual_model: None,
                     });
                     return Err(err);
                 }
@@ -2508,6 +2536,8 @@ impl Agent {
                     error_message: Some("request cancelled by user".into()),
                     input_tokens: None,
                     output_tokens: None,
+                    actual_provider: None,
+                    actual_model: None,
                 });
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2537,6 +2567,8 @@ impl Agent {
                     error_message: Some(safe_error),
                     input_tokens: None,
                     output_tokens: None,
+                    actual_provider: None,
+                    actual_model: None,
                 });
                 return Err(StreamedTurnError {
                     error: anyhow::Error::msg(stream_error.unwrap_or_default()),
@@ -2618,6 +2650,8 @@ impl Agent {
                                 error_message: Some("request cancelled by user".into()),
                                 input_tokens: None,
                                 output_tokens: None,
+                                actual_provider: None,
+                                actual_model: None,
                             });
                             return Err(StreamedTurnError {
                                 error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -2642,6 +2676,8 @@ impl Agent {
                             error_message: Some(safe_error),
                             input_tokens: None,
                             output_tokens: None,
+                            actual_provider: None,
+                            actual_model: None,
                         });
                         if got_stream && !streamed_text.is_empty() {
                             let partial = Self::marked_partial_response(
@@ -2676,6 +2712,8 @@ impl Agent {
                 error_message: None,
                 input_tokens: resp_input_tokens,
                 output_tokens: resp_output_tokens,
+                actual_provider: None,
+                actual_model: None,
             });
 
             // Forward per-call token usage so the WS gateway (and any other

@@ -1225,11 +1225,22 @@ impl DelegateTool {
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let inner_started_at = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            model_provider.chat(chat_request, &model, temperature),
-        )
-        .await;
+        // Patch ② emission-site wiring: `scope_provider_fallback` captures any
+        // in-call provider fallback (RFC #5890 / patch ④) so we can surface
+        // `actual_provider` / `actual_model` on the LlmResponse event below.
+        // Bare-tuple async block (no `?`): the timeout/chat outcome is a value
+        // bound back into `result`, mirroring loop_.rs.
+        let (result, provider_fallback_info) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let r = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    model_provider.chat(chat_request, &model, temperature),
+                )
+                .await;
+                let fb = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (r, fb)
+            })
+            .await;
 
         let result = match result {
             Ok(inner) => inner,
@@ -1248,9 +1259,16 @@ impl DelegateTool {
             Ok(response) => {
                 // Per-delegate inner-call telemetry: emit an LlmResponse so
                 // zc-delegate-stats can attribute tokens + latency to this
-                // non-agentic delegate. provider/model are the configured ones
-                // (no cross-provider fallback on the delegate path in this
-                // build — see the deferred per-agent fallback work).
+                // non-agentic delegate. model_provider/model are the configured
+                // identifiers; actual_provider/actual_model (patch ②) carry the
+                // served-from attribution when a fallback chain (RFC #5890 /
+                // patch ④) advances past the primary. Dormant on this path in
+                // this build: the delegate builds a single concrete provider via
+                // `create_model_provider_with_options` (no ReliableModelProvider
+                // chain), so `take_last_provider_fallback()` stays None here —
+                // the scope wrap is kept for forward-compat parity with the
+                // loop_.rs path and lights up automatically once a
+                // fallback-capable provider is wired for delegates.
                 if let Some(observer) = &self.observer {
                     let (input_tokens, output_tokens) = response
                         .usage
@@ -1265,6 +1283,12 @@ impl DelegateTool {
                         error_message: None,
                         input_tokens,
                         output_tokens,
+                        actual_provider: provider_fallback_info
+                            .as_ref()
+                            .map(|fb| fb.actual_provider.clone()),
+                        actual_model: provider_fallback_info
+                            .as_ref()
+                            .map(|fb| fb.actual_model.clone()),
                     });
                 }
 

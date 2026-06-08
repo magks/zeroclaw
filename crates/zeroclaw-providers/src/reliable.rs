@@ -3589,6 +3589,95 @@ mod tests {
         .await;
     }
 
+    /// Patch ② end-to-end attribution contract: a real fallback chain
+    /// (primary fails → fallback serves) captured inside
+    /// `scope_provider_fallback` must surface on `ObserverEvent::LlmResponse`
+    /// as `actual_provider`/`actual_model` via the exact `.as_ref().map(...)`
+    /// shape the emission sites (`loop_.rs` / `delegate.rs`) use. This is the
+    /// "the LlmResponse event carries actual_provider after a fallback"
+    /// guarantee that `zc-delegate-stats` / the runtime-trace rely on, and it
+    /// locks the `ProviderFallbackInfo` field names the runtime emission
+    /// depends on (a rename there would otherwise silently break attribution).
+    #[tokio::test]
+    async fn fallback_attribution_populates_llm_response_event() {
+        use zeroclaw_api::observability_traits::ObserverEvent;
+
+        // 1) Drive a genuine provider fallback and capture the served-from info
+        //    exactly as the emission sites do (scope → chat → take).
+        let provider_fallback_info = scope_provider_fallback(async {
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "broken".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 99, // always fail
+                            response: "unused",
+                            error: "401 Unauthorized",
+                        }),
+                    ),
+                    (
+                        "working".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "served by fallback",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                2,
+                1,
+            );
+            let resp = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .unwrap();
+            assert_eq!(resp, "served by fallback");
+            take_last_provider_fallback()
+        })
+        .await;
+
+        // 2) Build the LlmResponse with the SAME mapping loop_.rs/delegate.rs
+        //    apply: configured ids stay put; actual_* carry the served-from.
+        let event = ObserverEvent::LlmResponse {
+            model_provider: "broken".into(),
+            model: "test-model".into(),
+            duration: std::time::Duration::from_millis(1),
+            success: true,
+            error_message: None,
+            input_tokens: None,
+            output_tokens: None,
+            actual_provider: provider_fallback_info
+                .as_ref()
+                .map(|fb| fb.actual_provider.clone()),
+            actual_model: provider_fallback_info
+                .as_ref()
+                .map(|fb| fb.actual_model.clone()),
+        };
+
+        // 3) The event carries the served-from attribution while keeping the
+        //    configured identifiers stable for cost-rollups.
+        match event {
+            ObserverEvent::LlmResponse {
+                model_provider,
+                actual_provider,
+                actual_model,
+                ..
+            } => {
+                assert_eq!(model_provider, "broken", "configured provider stays put");
+                assert_eq!(
+                    actual_provider.as_deref(),
+                    Some("working"),
+                    "served-from provider must be attributed after a fallback"
+                );
+                assert_eq!(actual_model.as_deref(), Some("test-model"));
+            }
+            _ => unreachable!("constructed an LlmResponse"),
+        }
+    }
+
     // Regression for #6589: ReliableModelProvider::supports_vision() must reflect the
     // primary (first) provider, not .any() across the fallback chain. This mirrors
     // supports_native_tools() which already uses .first().

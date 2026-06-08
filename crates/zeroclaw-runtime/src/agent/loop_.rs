@@ -1716,7 +1716,16 @@ pub async fn run_tool_call_loop(
         let mut streamed_live_deltas = false;
         let mut streamed_protocol_suppressed = false;
 
-        let chat_result = if should_consume_provider_stream {
+        // Patch ② emission-site wiring: wrap the chat() dispatch in a
+        // `scope_provider_fallback` so any provider fallback fired inside
+        // `ReliableModelProvider::chat()` (RFC #5890 / patch ④) is captured
+        // here via `take_last_provider_fallback()`. The async block returns
+        // `(chat_result, fallback_info)`; cancellation/timeout paths inside
+        // still use `return Err(...)` / `bail!`, which now exit the async
+        // block and re-propagate via `?` to the outer fn (semantics-preserving).
+        let (chat_result, provider_fallback_info) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let chat_result = if should_consume_provider_stream {
             use ::zeroclaw_log::Instrument;
             let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
             let stream_future = ::zeroclaw_log::scope!(
@@ -1854,6 +1863,10 @@ pub async fn run_tool_call_loop(
                 }
             }
         };
+                let fb = zeroclaw_providers::reliable::take_last_provider_fallback();
+                Ok::<_, anyhow::Error>((chat_result, fb))
+            })
+            .await?;
 
         let (
             response_text,
@@ -1880,6 +1893,16 @@ pub async fn run_tool_call_loop(
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
+                    // Patch ② attribution: populated when the
+                    // `scope_provider_fallback` wrap (above) saw a fallback
+                    // fire inside `ReliableModelProvider::chat()`. `None` when
+                    // the configured provider served the request directly.
+                    actual_provider: provider_fallback_info
+                        .as_ref()
+                        .map(|fb| fb.actual_provider.clone()),
+                    actual_model: provider_fallback_info
+                        .as_ref()
+                        .map(|fb| fb.actual_model.clone()),
                 });
 
                 // Record cost via task-local tracker (no-op when not scoped)
@@ -2036,6 +2059,16 @@ pub async fn run_tool_call_loop(
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    // Patch ② attribution: even on failure the fallback chain
+                    // may have advanced to a later provider before this final
+                    // error; reflects the last attempted served-by, or `None`
+                    // if the primary failed without ever falling back.
+                    actual_provider: provider_fallback_info
+                        .as_ref()
+                        .map(|fb| fb.actual_provider.clone()),
+                    actual_model: provider_fallback_info
+                        .as_ref()
+                        .map(|fb| fb.actual_model.clone()),
                 });
                 ::zeroclaw_log::record!(
                     WARN,

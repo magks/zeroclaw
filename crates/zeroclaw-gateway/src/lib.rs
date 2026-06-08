@@ -2437,6 +2437,10 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens: None,
                     output_tokens: None,
+                    // Gateway constructs this event synthetically; it doesn't
+                    // own a fallback-chain scope, so configured == served.
+                    actual_provider: None,
+                    actual_model: None,
                 },
             );
             state.observer.record_metric(
@@ -2468,6 +2472,8 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    actual_provider: None,
+                    actual_model: None,
                 },
             );
             state.observer.record_metric(

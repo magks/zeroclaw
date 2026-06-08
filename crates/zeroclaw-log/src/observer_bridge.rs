@@ -114,6 +114,20 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
                 .attributes
                 .get("output_tokens")
                 .and_then(serde_json::Value::as_u64),
+            // Bridge reads patch ② attribution fields from LogEvent attrs
+            // when present (set by the LogObserver from the emission site's
+            // `take_last_provider_fallback()` capture). `None` for legacy
+            // events that predate the field add.
+            actual_provider: event
+                .attributes
+                .get("actual_provider")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            actual_model: event
+                .attributes
+                .get("actual_model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
             tool,

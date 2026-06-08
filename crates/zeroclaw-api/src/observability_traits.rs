@@ -24,13 +24,24 @@ pub enum ObserverEvent {
     },
     /// Result of a single LLM model_provider call.
     LlmResponse {
+        /// Configured model_provider (what the caller asked for). Stays
+        /// stable for cost-attribution rollups even when a fallback chain
+        /// (RFC #5890 / patch ④) routes the call to a different provider.
         model_provider: String,
+        /// Configured model. Same configured-vs-served distinction as
+        /// `model_provider`.
         model: String,
         duration: Duration,
         success: bool,
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        /// Patch ② attribution: actually-served model_provider when a
+        /// fallback fired (via `take_last_provider_fallback()` at the
+        /// emission site). `None` = served by the configured provider.
+        actual_provider: Option<String>,
+        /// Patch ② attribution: actually-served model. See `actual_provider`.
+        actual_model: Option<String>,
     },
     /// The agent session has finished.
     ///
