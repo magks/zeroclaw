@@ -21,6 +21,15 @@ use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 
+/// Shared neutral base workspace used by [`DelegateTool::profile_grants`] as
+/// the `workspace_dir` for BOTH agents' capability-grants policies. Resolving
+/// every agent's risk-profile roots against the SAME base means a per-agent
+/// workspace jail (each agent's distinct real `workspace_dir`) never reads as
+/// a false escalation; the cross-agent FS tiers (`workspace.access`,
+/// `unrestricted_filesystem`) are re-applied on top so genuine broadening is
+/// still compared.
+const GRANT_CMP_WORKSPACE: &str = "/__zc_delegate_grant_cmp__";
+
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
@@ -453,6 +462,19 @@ impl DelegateTool {
         };
         // Narrowing gate: the target's grants must be no broader than the
         // caller's. A BROADER target is a privilege escalation → refuse.
+        //
+        // NOTE — one filesystem dimension is deliberately NOT compared here:
+        // each agent's OWN `workspace_dir` location/breadth (an operator-set
+        // `agents.<a>.workspace.path`). `profile_grants` neutralizes it (both
+        // agents share the sentinel base), because comparing it would refuse
+        // ALL cross-profile delegation (sibling agents always have distinct,
+        // non-nested own workspaces). A target with a custom `workspace.path`
+        // onto a large/foreign subtree is therefore NOT caught by this gate.
+        // It is inert on the only path the gate allows today (non-agentic,
+        // toolless — no filesystem tool runs); it MUST be addressed before
+        // cross-profile AGENTIC delegation (where the target would run FS
+        // tools jailed to that workspace) is enabled. Tracked as a follow-up,
+        // alongside the out-of-scope 0-sentinel shell_timeout/max_cost item.
         if let Err(escalation) = target_grants.ensure_no_escalation_beyond(&caller_grants) {
             return Err(format!(
                 "delegate target {target_alias:?} (risk profile {target_profile:?}) would \
@@ -461,12 +483,24 @@ impl DelegateTool {
                 self.security.risk_profile_name
             ));
         }
-        // `ensure_no_escalation_beyond` does not cover the tool allowlist;
-        // close that dimension explicitly.
+        // `ensure_no_escalation_beyond` does not cover tool authorization;
+        // close the `allowed_tools` / `excluded_tools` dimension explicitly.
         if let Err(tool) = Self::target_tools_within_caller(&caller_grants, &target_grants) {
             return Err(format!(
-                "delegate target {target_alias:?} may use tool {tool:?}, which the caller's \
+                "delegate target {target_alias:?} would authorize {tool}, which the caller's \
                  profile ({:?}) does not permit — delegation is narrowing-only.",
+                self.security.risk_profile_name
+            ));
+        }
+        // Nor does it cover the approval (auto_approve / always_ask) or
+        // sandbox dimensions; a target that relaxes any of these runs broader
+        // than the caller even when every grant above is narrower.
+        if let Err(reason) =
+            Self::target_approval_sandbox_within_caller(&caller_grants, &target_grants)
+        {
+            return Err(format!(
+                "delegate target {target_alias:?} {reason}, which the caller's profile ({:?}) \
+                 enforces — delegation is narrowing-only.",
                 self.security.risk_profile_name
             ));
         }
@@ -493,45 +527,222 @@ impl DelegateTool {
         Ok(())
     }
 
-    /// Build a capability-grants-only policy for `alias` from its risk +
-    /// runtime profiles on a SHARED neutral workspace, for the narrowing
-    /// comparison in [`Self::cross_profile_decision`]. The shared workspace
-    /// cancels the per-agent workspace jail that [`SecurityPolicy::for_agent`]
-    /// would add (sibling agents on the same profile have non-overlapping
-    /// workspace roots — a false "escalation"). `None` when the agent or its
-    /// risk profile cannot be resolved.
+    /// Build the capability-grants policy for `alias` used by the narrowing
+    /// comparison in [`Self::cross_profile_decision`].
+    ///
+    /// Resolves the agent's risk + runtime profiles against a SHARED neutral
+    /// base workspace ([`GRANT_CMP_WORKSPACE`]) via
+    /// [`SecurityPolicy::from_profiles`]. Anchoring BOTH agents on the same
+    /// base means every risk-profile `allowed_roots` entry — workspace-relative
+    /// OR absolute — resolves to identical text for both, so a per-agent
+    /// workspace jail (each agent's distinct real `workspace_dir`) never reads
+    /// as a false escalation. (Anchoring on each agent's own `for_agent`
+    /// workspace instead would sentinel-rewrite a shared absolute root for only
+    /// the agent whose `workspace.path` happens to nest it, false-refusing
+    /// provably-identical grants.)
+    ///
+    /// On top of that base it RE-APPLIES exactly the cross-agent filesystem
+    /// tiers that `from_profiles` drops but the dispatched
+    /// [`SecurityPolicy::for_agent`] policy carries, so the gate actually
+    /// compares them (the gap this hardening closes): `workspace.access`
+    /// sibling grants (per-config absolute paths, so genuine cross-agent
+    /// broadening is preserved) and the `unrestricted_filesystem` escape hatch
+    /// (which clears `workspace_only`). Persona-bundle equipment is merged
+    /// against the shared base too, so same-persona agents still align while a
+    /// persona that grants extra absolute roots/commands is compared. The
+    /// per-agent own `workspace_dir` itself is deliberately NOT compared — see
+    /// [`Self::cross_profile_decision`].
+    ///
+    /// `None` when the agent or its risk profile cannot be resolved (the
+    /// caller then falls back to the conservative same-profile requirement).
     fn profile_grants(config: &Config, alias: &str) -> Option<SecurityPolicy> {
+        use zeroclaw_config::multi_agent::AccessMode;
         let agent = config.agents.get(alias)?;
         let risk = config.risk_profiles.get(agent.risk_profile.trim())?;
         let runtime = config.runtime_profiles.get(agent.runtime_profile.trim());
-        Some(SecurityPolicy::from_profiles(
-            risk,
-            runtime,
-            Path::new("/__zc_delegate_grant_cmp__"),
-        ))
+        let mut policy =
+            SecurityPolicy::from_profiles(risk, runtime, Path::new(GRANT_CMP_WORKSPACE));
+        policy.risk_profile_name = agent.risk_profile.trim().to_string();
+        // Mirror `for_agent`'s cross-agent tier resolution exactly (policy.rs),
+        // minus the per-agent workspace anchoring we deliberately neutralize.
+        for (sibling, mode) in &agent.workspace.access {
+            let sibling_dir = config.agent_workspace_dir(sibling.as_str());
+            match mode {
+                AccessMode::Read => policy.allowed_roots_read_only.push(sibling_dir),
+                AccessMode::Write => policy.allowed_roots_write_only.push(sibling_dir),
+                AccessMode::ReadWrite => policy.allowed_roots.push(sibling_dir),
+            }
+        }
+        if agent.workspace.unrestricted_filesystem {
+            policy.workspace_only = false;
+        }
+        policy.merge_persona_bundle_equipment(config, alias);
+        Some(policy)
     }
 
-    /// Returns `Err(tool)` if the target's EXPLICIT tool allowlist names a
-    /// tool the caller's profile does not permit (tool-authorization
-    /// broadening). Compares only when both profiles set an explicit
-    /// `allowed_tools` list: an empty profile list resolves to `None` ("no
-    /// authorization constraint"), left to the other gates (a non-agentic
-    /// target never runs tools; a cross-profile agentic target is refused
-    /// outright). Closes the `allowed_tools` dimension that
-    /// `ensure_no_escalation_beyond` does not cover, without false-refusing
-    /// the common empty-allowlist non-agentic delegate.
+    /// Returns `Err(descriptor)` if the target's EFFECTIVE tool authorization
+    /// admits a tool the caller's does not — i.e. the target's net tool set is
+    /// not a subset of the caller's. Covers BOTH the `allowed_tools` allowlist
+    /// (every arm, including the `(Some, None)` case where the target carries
+    /// no allowlist while the caller restricts — an unrestricted target) AND
+    /// `excluded_tools` (a smaller target denylist re-authorizes a tool the
+    /// caller denies). [`SecurityPolicy::is_tool_allowed`] folds the
+    /// allow+exclude pair into one predicate, so each arm reduces to "every
+    /// tool the target can actually use must also be caller-usable".
+    ///
+    /// `descriptor` is a human-readable clause for the rejection message
+    /// (`tool "shell"`, or `every tool …` for the unrestricted-target case).
     fn target_tools_within_caller(
         caller: &SecurityPolicy,
         target: &SecurityPolicy,
     ) -> Result<(), String> {
-        if let (Some(_), Some(target_allow)) = (&caller.allowed_tools, &target.allowed_tools) {
-            for name in target_allow {
-                if !caller.is_tool_allowed(name) {
-                    return Err(name.clone());
+        match (&caller.allowed_tools, &target.allowed_tools) {
+            // Caller restricts to an allowlist but the target carries none →
+            // the target may run any tool the caller's allowlist omits.
+            (Some(_), None) => Err(
+                "every tool (the target has no allowed_tools allowlist while the caller restricts to one)"
+                    .to_string(),
+            ),
+            // Target carries an explicit allowlist (caller restricted or not):
+            // every tool the target can actually use (allowed AND not
+            // self-excluded) must also be usable by the caller.
+            (_, Some(target_allow)) => {
+                for name in target_allow {
+                    if target.is_tool_allowed(name) && !caller.is_tool_allowed(name) {
+                        return Err(format!("tool {name:?}"));
+                    }
                 }
+                Ok(())
+            }
+            // Neither restricts via an allowlist: only the denylists differ.
+            // Every tool the caller denies must stay denied by the target,
+            // else the target re-authorizes it.
+            (None, None) => {
+                if let Some(caller_excluded) = &caller.excluded_tools {
+                    for name in caller_excluded {
+                        if target.is_tool_allowed(name) {
+                            return Err(format!("tool {name:?} (which the caller excludes)"));
+                        }
+                    }
+                }
+                Ok(())
             }
         }
+    }
+
+    /// Returns `Err(reason)` when the target relaxes an APPROVAL or SANDBOX
+    /// constraint the caller enforces — dimensions `ensure_no_escalation_beyond`
+    /// and `target_tools_within_caller` do not cover. Each is "target at least
+    /// as restrictive as the caller":
+    /// * `auto_approve`: the target must not auto-approve (skip the approval
+    ///   prompt for) any tool — or the `*` blanket — the caller does not
+    ///   auto-approve. (`auto_approve ⊆ caller.auto_approve`.)
+    /// * `always_ask`: the target must not DROP an `always_ask` the caller
+    ///   requires (the `*` blanket included). (`caller.always_ask ⊆ target`.)
+    /// * sandbox: when the caller runs EFFECTIVELY sandboxed (see
+    ///   [`Self::effectively_sandboxed`] — which mirrors runtime enforcement,
+    ///   so the common backend-set / `sandbox_enabled`-unset default counts),
+    ///   the target must too, on the SAME resolved backend. (When the caller is
+    ///   not effectively sandboxed the dimension is unconstrained — avoids
+    ///   false-refusing the symmetric default configuration.) `firejail_args` is
+    ///   deliberately NOT compared: the runtime hard-codes the firejail flag set
+    ///   and never forwards `firejail_args` (see `security::firejail`), so it is
+    ///   runtime-inert today and comparing it would only false-refuse
+    ///   runtime-identical delegations — see the inline note for the comparison
+    ///   to add once the runtime wires it through.
+    ///
+    /// `reason` is a human-readable verb-phrase for the rejection message.
+    fn target_approval_sandbox_within_caller(
+        caller: &SecurityPolicy,
+        target: &SecurityPolicy,
+    ) -> Result<(), String> {
+        // auto_approve: target ⊆ caller (a target `*` requires a caller `*`).
+        let caller_auto_all = caller.auto_approve.iter().any(|t| t == "*");
+        for tool in &target.auto_approve {
+            if !caller_auto_all && !caller.auto_approve.iter().any(|t| t == tool) {
+                return Err(format!(
+                    "auto-approves {tool:?}, bypassing an approval prompt the caller requires"
+                ));
+            }
+        }
+        // always_ask: caller ⊆ target (the target may not drop a requirement).
+        let target_ask_all = target.always_ask.iter().any(|t| t == "*");
+        for tool in &caller.always_ask {
+            if !target_ask_all && !target.always_ask.iter().any(|t| t == tool) {
+                return Err(format!(
+                    "drops the always-ask approval the caller requires for {tool:?}"
+                ));
+            }
+        }
+        // sandbox: compare EFFECTIVE sandbox state, mirroring runtime
+        // enforcement (zeroclaw-config `RiskProfileConfig::sandbox_config` +
+        // `security::detect::create_sandbox`): a policy runs sandboxed iff its
+        // resolved backend is not `none` AND `sandbox_enabled != Some(false)`
+        // (an unset backend resolves to `auto`; an unset `sandbox_enabled`
+        // leaves the sandbox ACTIVE). The earlier `sandbox_enabled == Some(true)`
+        // guard missed that active-by-default regime, letting a strictly
+        // unsandboxed target slip past.
+        if Self::effectively_sandboxed(caller) {
+            if !Self::effectively_sandboxed(target) {
+                return Err(
+                    "runs unsandboxed where the caller runs sandboxed (sandbox_enabled / sandbox_backend)"
+                        .to_string(),
+                );
+            }
+            // Both run sandboxed. Backends are not orderable, so require the
+            // SAME resolved backend (a different backend is not provably
+            // no-weaker).
+            let caller_backend = Self::resolved_sandbox_backend(caller);
+            let target_backend = Self::resolved_sandbox_backend(target);
+            if caller_backend != target_backend {
+                return Err(format!(
+                    "uses sandbox backend {target_backend:?} where the caller uses {caller_backend:?} (a different backend is not provably narrower)"
+                ));
+            }
+            // NOTE: `firejail_args` is intentionally NOT compared. The runtime
+            // `FirejailSandbox::wrap_command` hard-codes its flag set and never
+            // forwards policy `firejail_args` to the firejail invocation, so the
+            // field is runtime-INERT: two profiles differing only in
+            // `firejail_args` produce a byte-identical sandbox, and comparing it
+            // would false-refuse runtime-identical delegations. When the runtime
+            // starts forwarding `firejail_args`, add an EQUALITY check here — the
+            // arg space is non-monotone (e.g. `--noprofile` loosens confinement
+            // while keeping every caller flag), so subset containment is unsound.
+        }
         Ok(())
+    }
+
+    /// Resolve a policy's sandbox backend to the normalized token the runtime
+    /// uses, mirroring `RiskProfileConfig::sandbox_config` (trim / lowercase /
+    /// unset → `auto`) + `parse_sandbox_backend`. Kept as a string token so
+    /// this crate need not reach into the (private) parser; the trailing
+    /// `_ => "auto"` arm matches the parser's `_ => SandboxBackend::default()`
+    /// so unknown or newly-added names behave identically on both sides.
+    fn resolved_sandbox_backend(policy: &SecurityPolicy) -> &'static str {
+        match policy
+            .sandbox_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("auto") => "auto",
+            Some("landlock") => "landlock",
+            Some("firejail") => "firejail",
+            Some("bubblewrap") => "bubblewrap",
+            Some("docker") => "docker",
+            Some("sandbox-exec" | "sandboxexec" | "seatbelt") => "sandbox-exec",
+            Some("none") => "none",
+            Some(_) => "auto",
+        }
+    }
+
+    /// True when `policy` runs under a real sandbox at enforcement time,
+    /// mirroring `security::detect::create_sandbox`: a `NoopSandbox` results
+    /// iff the resolved backend is `none` OR `sandbox_enabled == Some(false)`.
+    fn effectively_sandboxed(policy: &SecurityPolicy) -> bool {
+        Self::resolved_sandbox_backend(policy) != "none" && policy.sandbox_enabled != Some(false)
     }
 
     /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
@@ -612,7 +823,15 @@ impl DelegateTool {
     }
 
     /// Resolve agentic mode flag from the named runtime profile (default: false).
+    ///
+    /// Trims the reference before lookup so this dispatch-side resolution can
+    /// never disagree with [`Self::cross_profile_decision`]'s gate, which reads
+    /// `agentic` via a TRIMMED `runtime_profiles.get(...)`. A whitespace-padded
+    /// `runtime_profile` must not make the gate read non-agentic (and allow a
+    /// cross-profile delegate) while dispatch reads agentic (and runs the
+    /// reused-tool-registry loop), or vice versa.
     fn resolve_agentic(&self, runtime_profile: &str) -> bool {
+        let runtime_profile = runtime_profile.trim();
         if runtime_profile.is_empty() {
             return false;
         }
@@ -4459,5 +4678,293 @@ model_provider = "zai.comment"
             !desc.contains("target"),
             "broader target must NOT be advertised: {desc}"
         );
+    }
+
+    // ── HARDEN: comparison-completeness gaps closed in cross_profile_decision ──
+
+    /// Build a 2-agent cross-profile config (caller `c_rp`, delegation
+    /// allowed; target `t_rp`, optionally mutated) and return the
+    /// narrowing-gate result for delegating caller → target. Shared by the
+    /// HARDEN gap tests so each can vary exactly ONE capability dimension.
+    fn harden_gate(
+        caller_rp: RiskProfileConfig,
+        target_rp: RiskProfileConfig,
+        mutate_target: impl FnOnce(&mut AliasedAgentConfig),
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        let mut config = Config::default();
+        let mut caller_rp = caller_rp;
+        // The caller must permit delegation, else gate 1 rejects before the
+        // narrowing comparison under test is reached.
+        caller_rp.delegation_policy = DelegationPolicy {
+            mode: DelegationMode::Allow,
+        };
+        config.risk_profiles.insert("c_rp".to_string(), caller_rp);
+        config.risk_profiles.insert("t_rp".to_string(), target_rp);
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "c_rp".to_string(),
+                model_provider: "ollama.caller".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let mut target = AliasedAgentConfig {
+            risk_profile: "t_rp".to_string(),
+            model_provider: "ollama.target".into(),
+            ..AliasedAgentConfig::default()
+        };
+        mutate_target(&mut target);
+        config.agents.insert("target".to_string(), target);
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            agents.insert(name.clone(), agent.clone());
+        }
+        DelegateTool::new(agents, None, caller_policy)
+            .with_root_config(config)
+            .with_caller_alias("caller")
+            .policy_for_target("target")
+    }
+
+    /// GAP 1 [HIGH] — workspace FS tiers. `profile_grants` compares grants
+    /// built on a shared neutral base with the cross-agent FS tiers
+    /// (`workspace.access`, `unrestricted_filesystem` → `workspace_only`)
+    /// re-applied. A target broader on any of those tiers is now refused; a
+    /// same-scope target (whose only difference is its per-agent workspace
+    /// jail, relative OR absolute) is still allowed.
+    #[tokio::test]
+    async fn delegate_refuses_broader_workspace_fs_target() {
+        use zeroclaw_config::multi_agent::{AccessMode, AgentAlias};
+
+        // (a) `unrestricted_filesystem` clears `workspace_only` — strictly
+        // broader filesystem reach. Every from_profiles dimension is identical,
+        // so the pre-HARDEN gate (which never read this flag) ALLOWED it.
+        let err = harden_gate(
+            RiskProfileConfig::default(),
+            RiskProfileConfig::default(),
+            |t| t.workspace.unrestricted_filesystem = true,
+        )
+        .expect_err("a target with unrestricted_filesystem is broader and must be refused");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("narrowing-only"),
+            "unrestricted_filesystem must be refused as narrowing violation: {chain}"
+        );
+
+        // (b) a `workspace.access` grant adds a sibling workspace root the
+        // caller lacks — a cross-agent read+write tier the old from_profiles
+        // build hard-coded to empty and never compared.
+        let err = harden_gate(
+            RiskProfileConfig::default(),
+            RiskProfileConfig::default(),
+            |t| {
+                t.workspace
+                    .access
+                    .insert(AgentAlias::new("sib"), AccessMode::ReadWrite);
+            },
+        )
+        .expect_err("a target granted a sibling workspace root must be refused");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("narrowing-only"),
+            "workspace.access broadening must be refused: {chain}"
+        );
+
+        // (c) NO false refusal: two cross-profile agents whose risk profiles
+        // each declare the SAME workspace-RELATIVE allowed_root. Resolving both
+        // on the shared neutral base aligns them, so the narrower-equal target
+        // is correctly ALLOWED.
+        let rel_root = || RiskProfileConfig {
+            allowed_roots: vec!["data".into()],
+            ..RiskProfileConfig::default()
+        };
+        let resolved = harden_gate(rel_root(), rel_root(), |_| {})
+            .expect("workspace-relative roots must align on the shared base (no false refusal)");
+        assert_eq!(
+            resolved.risk_profile_name, "t_rp",
+            "a same-scope cross-profile target must run under its own policy"
+        );
+
+        // (d) NO false refusal (regression for the neutralization rewrite): a
+        // SHARED ABSOLUTE risk-profile root that NESTS under the target's
+        // custom `workspace.path` must still compare equal to the caller's
+        // identical literal root. The earlier per-agent neutralization rewrote
+        // the root onto the sentinel for the nesting agent only, false-refusing
+        // provably-identical grants; resolving on a shared base (never the
+        // per-agent workspace) keeps the absolute root literal on BOTH sides.
+        let abs_root = || RiskProfileConfig {
+            allowed_roots: vec!["/srv/proj/src".into()],
+            ..RiskProfileConfig::default()
+        };
+        let resolved = harden_gate(abs_root(), abs_root(), |t| {
+            t.workspace.path = Some(std::path::PathBuf::from("/srv/proj"));
+        })
+        .expect("identical absolute roots must compare equal even when a workspace.path nests them");
+        assert_eq!(
+            resolved.risk_profile_name, "t_rp",
+            "shared absolute roots must not false-refuse under a custom workspace.path"
+        );
+    }
+
+    /// GAP 2 [MED] — tool / approval / sandbox dimensions. `ensure_no_escalation_beyond`
+    /// covers none of these; `target_tools_within_caller` (now both
+    /// allowed_tools arms + excluded_tools) and `target_approval_sandbox_within_caller`
+    /// close them. Each sub-case varies exactly ONE dimension to broaden the
+    /// target; one negative control proves no false refusal.
+    #[tokio::test]
+    async fn delegate_refuses_relaxed_tool_approval_sandbox_dims() {
+        let base = RiskProfileConfig::default;
+
+        // (a) excluded_tools: caller denies "shell"; target denies nothing →
+        // the target re-authorizes a tool the caller excludes. REFUSED.
+        let mut caller = base();
+        caller.excluded_tools = vec!["shell".into()];
+        let err = harden_gate(caller.clone(), base(), |_| {}).expect_err(
+            "a smaller target excluded_tools set re-authorizes a caller-denied tool",
+        );
+        assert!(
+            format!("{err:#}").contains("narrowing-only"),
+            "excluded_tools broadening: {err:#}"
+        );
+
+        // ...and a target that ALSO excludes shell (a superset denylist) is
+        // narrower → ALLOWED (no false refusal).
+        let mut target = base();
+        target.excluded_tools = vec!["shell".into(), "file_write".into()];
+        let ok = harden_gate(caller, target, |_| {});
+        assert!(
+            ok.is_ok(),
+            "a target with a superset excluded_tools set must be allowed: {ok:?}"
+        );
+
+        // (b) allowed_tools (Some, None) arm: caller restricts to [read_file];
+        // the target carries no allowlist (unrestricted) → REFUSED. The
+        // pre-HARDEN (Some, Some)-only check skipped this arm.
+        let mut caller = base();
+        caller.allowed_tools = vec!["read_file".into()];
+        let err = harden_gate(caller, base(), |_| {}).expect_err(
+            "an unrestricted target under a caller that restricts allowed_tools must be refused",
+        );
+        assert!(
+            format!("{err:#}").contains("narrowing-only"),
+            "(Some,None) allowed_tools arm: {err:#}"
+        );
+
+        // (c) auto_approve: the target auto-approves a tool the caller does
+        // not — bypassing an approval the caller requires. REFUSED.
+        let mut target = base();
+        target.auto_approve.push("shell".into());
+        let err = harden_gate(base(), target, |_| {})
+            .expect_err("a target auto-approving a tool the caller does not must be refused");
+        assert!(
+            format!("{err:#}").contains("auto-approves"),
+            "auto_approve broadening: {err:#}"
+        );
+
+        // (d) always_ask: the caller requires always-ask for file_write; the
+        // target drops it. REFUSED.
+        let mut caller = base();
+        caller.always_ask = vec!["file_write".into()];
+        let err = harden_gate(caller, base(), |_| {})
+            .expect_err("a target dropping an always_ask the caller requires must be refused");
+        assert!(
+            format!("{err:#}").contains("always-ask"),
+            "always_ask drop: {err:#}"
+        );
+
+        // (e) sandbox: the caller runs sandboxed via the COMMON active-by-
+        // default regime (backend set, `sandbox_enabled` unset → None →
+        // effectively sandboxed); the target sets `sandbox_enabled = false`
+        // → NoopSandbox, strictly unsandboxed. REFUSED. The pre-fix
+        // `caller.sandbox_enabled == Some(true)` guard MISSED this (the
+        // caller's flag is None), which the adversarial review caught.
+        let mut caller = base();
+        caller.sandbox_backend = Some("firejail".into());
+        let mut target = base();
+        target.sandbox_backend = Some("firejail".into());
+        target.sandbox_enabled = Some(false);
+        let err = harden_gate(caller, target, |_| {})
+            .expect_err("a target disabling the sandbox under an active-by-default caller must be refused");
+        assert!(
+            format!("{err:#}").contains("unsandboxed"),
+            "sandbox downgrade (None-but-active caller): {err:#}"
+        );
+
+        // (e2) sandbox backend `none` → NoopSandbox even with enabled unset →
+        // strictly unsandboxed under a sandboxed caller. REFUSED.
+        let mut caller = base();
+        caller.sandbox_backend = Some("firejail".into());
+        let mut target = base();
+        target.sandbox_backend = Some("none".into());
+        let err = harden_gate(caller, target, |_| {})
+            .expect_err("a target with sandbox_backend=none under a sandboxed caller must be refused");
+        assert!(
+            format!("{err:#}").contains("unsandboxed"),
+            "sandbox backend=none: {err:#}"
+        );
+
+        // (e3) NO false refusal: `firejail_args` is runtime-inert (the runtime
+        // hard-codes the firejail flag set and never forwards policy
+        // firejail_args), so a target with DIFFERENT firejail_args produces a
+        // byte-identical sandbox and must NOT be refused. Deliberate
+        // non-comparison; becomes an equality check once the runtime forwards
+        // firejail_args (the arg space is non-monotone). Guards against the
+        // over-strict equality clause the adversarial re-verify flagged.
+        let mut caller = base();
+        caller.sandbox_backend = Some("firejail".into());
+        caller.firejail_args = vec!["--net=none".into()];
+        let mut target = base();
+        target.sandbox_backend = Some("firejail".into());
+        target.firejail_args = vec!["--net=none".into(), "--noprofile".into()];
+        let ok = harden_gate(caller, target, |_| {});
+        assert!(
+            ok.is_ok(),
+            "differing but runtime-inert firejail_args must not false-refuse: {ok:?}"
+        );
+
+        // (e4) NO false refusal: identical sandbox config (same backend, both
+        // active-by-default) is narrower-or-equal → ALLOWED.
+        let mut caller = base();
+        caller.sandbox_backend = Some("firejail".into());
+        let mut target = base();
+        target.sandbox_backend = Some("firejail".into());
+        let ok = harden_gate(caller, target, |_| {});
+        assert!(
+            ok.is_ok(),
+            "identical sandbox config must be allowed (no false refusal): {ok:?}"
+        );
+    }
+
+    /// GAP 3 [LOW] — agentic-lookup trim divergence. `cross_profile_decision`
+    /// reads `agentic` via a TRIMMED `runtime_profiles.get(...)`; dispatch's
+    /// `resolve_agentic` previously did an UNTRIMMED get, so a whitespace-
+    /// padded `runtime_profile` could make the gate read non-agentic while
+    /// dispatch read agentic (or vice versa). `resolve_agentic` now trims, so
+    /// the two can never disagree.
+    #[test]
+    fn resolve_agentic_trims_runtime_profile_reference() {
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "agentic_rt".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(runtime_profiles);
+
+        // The trimmed lookup matches the gate's `runtime_profile.trim()` read;
+        // an untrimmed get would miss the padded reference and read false.
+        assert!(
+            tool.resolve_agentic("  agentic_rt  "),
+            "resolve_agentic must trim the reference to match the gate"
+        );
+        assert!(tool.resolve_agentic("agentic_rt"));
+        assert!(!tool.resolve_agentic("   "));
+        assert!(!tool.resolve_agentic("unknown_rt"));
     }
 }
