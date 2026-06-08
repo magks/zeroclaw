@@ -7991,6 +7991,9 @@ pub async fn start_channels(
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
+            // Persona-bundle overlay is wired on the CLI/ACP agent paths; the
+            // channel orchestrator does not compose persona bundles yet.
+            &[],
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -13666,6 +13669,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             0,
             false,
+            &[],
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -14005,6 +14009,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             0,
             false,
+            &[],
         );
 
         assert!(
@@ -14037,6 +14042,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             0,
             false,
+            &[],
         );
 
         assert!(

@@ -2,6 +2,7 @@ use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
 use crate::agent::eval::AutoClassifyExt;
+use crate::agent::personality::{self, ResolvedPersonaBundle};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -45,6 +46,11 @@ pub struct Agent {
     /// `workspace_dir`, which is the security sandbox root and can be the
     /// session cwd for IDE-driven sessions (ACP, gateway WS).
     agent_workspace_dir: std::path::PathBuf,
+    /// Persona bundles composed onto `agent_workspace_dir`, resolved from
+    /// `[agents.<X>].persona_bundles` at construction (the full `Config` is
+    /// only available there). Empty for agents without bundles. Mirrors how
+    /// `agent_workspace_dir`/`identity_config` are resolved-and-held.
+    persona_bundles: Vec<ResolvedPersonaBundle>,
     identity_config: zeroclaw_config::schema::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
@@ -188,6 +194,7 @@ pub struct AgentBuilder {
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     agent_workspace_dir: Option<std::path::PathBuf>,
+    persona_bundles: Option<Vec<ResolvedPersonaBundle>>,
     identity_config: Option<zeroclaw_config::schema::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<zeroclaw_config::schema::SkillsPromptInjectionMode>,
@@ -230,6 +237,7 @@ impl AgentBuilder {
             temperature: None,
             workspace_dir: None,
             agent_workspace_dir: None,
+            persona_bundles: None,
             identity_config: None,
             skills: None,
             skills_prompt_mode: None,
@@ -323,6 +331,11 @@ impl AgentBuilder {
 
     pub fn agent_workspace_dir(mut self, agent_workspace_dir: std::path::PathBuf) -> Self {
         self.agent_workspace_dir = Some(agent_workspace_dir);
+        self
+    }
+
+    pub fn persona_bundles(mut self, persona_bundles: Vec<ResolvedPersonaBundle>) -> Self {
+        self.persona_bundles = Some(persona_bundles);
         self
     }
 
@@ -558,6 +571,7 @@ impl AgentBuilder {
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
             }),
+            persona_bundles: self.persona_bundles.unwrap_or_default(),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
@@ -1016,8 +1030,13 @@ impl Agent {
         // IDENTITY.md / USER.md / TOOLS.md / BOOTSTRAP.md) on first
         // run. Idempotent — never overwrites existing files; only
         // fills in the gaps so a freshly-created agent has a basic
-        // identity to load.
-        if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
+        // identity to load. Skipped for bundle-driven agents: a persona
+        // bundle overlays onto an empty workspace, and since the workspace
+        // wins over bundles, scaffolded defaults would clobber the bundle
+        // (see should_seed_bootstrap_files).
+        if zeroclaw_config::schema::should_seed_bootstrap_files(agent_cfg)
+            && let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await
+        {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
@@ -1346,6 +1365,10 @@ impl Agent {
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
+            .persona_bundles(personality::resolve_agent_persona_bundles(
+                config,
+                agent_alias,
+            ))
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
@@ -1516,6 +1539,7 @@ impl Agent {
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
+            persona_bundles: &self.persona_bundles,
             model_name: &self.model_name,
             tools: prompt_tools,
             skills: &self.skills,

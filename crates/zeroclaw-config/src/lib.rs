@@ -18,6 +18,7 @@ pub mod migration;
 pub mod multi_agent;
 pub mod pairing;
 pub mod paths;
+pub mod persona_bundles;
 pub mod platform;
 pub mod policy;
 pub mod presets;
