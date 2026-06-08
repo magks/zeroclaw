@@ -318,35 +318,45 @@ impl DelegateTool {
         self
     }
 
-    /// Build a `SecurityPolicy` for the delegated target agent
-    /// validated as **mutually equivalent** to the caller's policy
-    /// (neither escalates nor narrows), with the caller's action /
-    /// cost tracker shared into the returned policy.
+    /// Build a `SecurityPolicy` for the delegated target agent, enforcing
+    /// the **narrowing-only** delegation invariant: a delegate may run under
+    /// a *different* risk profile than the caller ONLY when the target's
+    /// profile grants are **no broader than** the caller's (no privilege
+    /// escalation). Same-profile delegation is unchanged.
     ///
-    /// Returns:
-    /// - `Ok(target_policy)` when `root_config` is set, the target
-    ///   resolves, and the target's policy is equivalent to the
-    ///   caller's under [`SecurityPolicy::ensure_no_escalation_beyond`]
-    ///   in both directions. The returned policy's `tracker` field is
-    ///   the caller's `Arc`-shared tracker so delegated actions count
-    ///   against the caller's `max_actions_per_hour` /
-    ///   `max_cost_per_day_cents`.
-    /// - `Err(_)` on escalation: the target's risk profile or
-    ///   workspace.access map would widen permissions beyond the
-    ///   caller. The originating `EscalationViolation` is chained.
-    /// - `Err(_)` on narrowing: the target's policy is strictly
-    ///   tighter than the caller's. `DelegateTool` reuses the
-    ///   caller's `parent_tools` registry whose tools each hold the
-    ///   caller's `Arc<SecurityPolicy>` from registration time, so a
-    ///   narrower target would silently inherit the caller's broader
-    ///   allowlist — an over-grant the validator catches loudly here
-    ///   instead of letting it ship as an enforcement gap. The error
-    ///   message names `spawn_subagent` as the supported path for
-    ///   narrowed runs (it re-enters `agent::run`, which rebuilds the
-    ///   tool registry under the validated child policy).
-    /// - `Ok(self.security)` (caller's policy) when `root_config`
-    ///   is `None`. This branch only fires for the legacy unit-test
-    ///   constructors that don't plumb root config.
+    /// Gates, in order:
+    /// 1. `delegation_policy.permits()` — the operator's on/off switch
+    ///    (default `forbidden`). Unchanged.
+    /// 2. Cross-profile narrowing ([`Self::cross_profile_decision`]):
+    ///    - **Same profile** → allowed verbatim (identical grants; the
+    ///      agentic loop's reuse of the caller's tool registry is safe).
+    ///    - **Different profile, target not broader** (per
+    ///      [`SecurityPolicy::ensure_no_escalation_beyond`] over profile
+    ///      *grants*, plus an explicit `allowed_tools` subset check) AND
+    ///      **non-agentic** → allowed. The target runs under its OWN
+    ///      (narrower) policy; non-agentic delegates have no tool registry,
+    ///      so there is no escalation surface.
+    ///    - **Different profile, target broader** → refused (escalation).
+    ///    - **Different profile, agentic** → refused. The in-process agentic
+    ///      delegate loop reuses the caller's `parent_tools`, each bound to
+    ///      the caller's `Arc<SecurityPolicy>` at construction; running them
+    ///      for a different-profile target would enforce the CALLER's policy,
+    ///      not the target's — an escalation. Narrowed *agentic* runs go
+    ///      through `spawn_subagent` / a shared profile.
+    ///
+    /// The returned policy's `tracker` is the caller's `Arc`-shared tracker
+    /// so delegated actions count against the caller's `max_actions_per_hour`
+    /// / `max_cost_per_day_cents`.
+    ///
+    /// `Ok(self.security)` (the caller's policy) when `root_config` is `None`
+    /// — the legacy unit-test constructors that don't plumb root config.
+    ///
+    /// The narrowing comparison is over profile *grants* built via
+    /// [`SecurityPolicy::from_profiles`] on a shared neutral workspace, NOT
+    /// the per-agent resolved policies: [`SecurityPolicy::for_agent`] jails
+    /// each agent to its own workspace dir, so sibling agents on the SAME
+    /// profile have non-overlapping `allowed_roots` that would otherwise read
+    /// as a false escalation.
     fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
@@ -383,7 +393,7 @@ impl DelegateTool {
                 self.security.risk_profile_name
             )));
         }
-        if self.security.risk_profile_name != target_policy.risk_profile_name {
+        if let Err(reason) = self.cross_profile_decision(config, target_alias) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -393,16 +403,135 @@ impl DelegateTool {
                         "caller_risk_profile": self.security.risk_profile_name,
                         "target_risk_profile": target_policy.risk_profile_name,
                     })),
-                "delegate refused: target risk profile differs from caller"
+                "delegate refused: cross-profile narrowing gate"
             );
-            return Err(anyhow::Error::msg(format!(
-                "delegate target {target_alias:?} uses risk profile \
-                 {:?}, but delegation requires the same risk profile as the caller ({:?})",
-                target_policy.risk_profile_name, self.security.risk_profile_name
-            )));
+            return Err(anyhow::Error::msg(reason));
         }
         target_policy.tracker = self.security.tracker.clone();
         Ok(Arc::new(target_policy))
+    }
+
+    /// Per-target reachability decision for the narrowing-only delegation
+    /// gate (see [`Self::policy_for_target`]). Returns `Ok(())` when the
+    /// caller may delegate to `target_alias`, else `Err(reason)` with an
+    /// operator-facing explanation. The caller's global delegation on/off
+    /// switch (`delegation_policy.permits`) is enforced by the callers; this
+    /// decides only the per-target narrowing / agentic rules with no side
+    /// effects, so it is shared between enforcement
+    /// ([`Self::policy_for_target`]) and roster advertisement
+    /// ([`DelegateTool::parameters_schema`]).
+    fn cross_profile_decision(&self, config: &Config, target_alias: &str) -> Result<(), String> {
+        let Some(target_agent) = config.agents.get(target_alias) else {
+            return Err(format!("unknown delegate target {target_alias:?}"));
+        };
+        let target_profile = target_agent.risk_profile.trim();
+        // Same profile → identical grants; unchanged behavior (the agentic
+        // loop's reuse of the caller's tool registry is safe when the
+        // policies match).
+        if self.security.risk_profile_name == target_profile {
+            return Ok(());
+        }
+        // Cross-profile: compare profile GRANTS (not the per-agent resolved
+        // policies — see `policy_for_target` doc). Without a resolvable caller
+        // alias, fall back to the conservative same-profile requirement.
+        let same_profile_required = || {
+            format!(
+                "delegate target {target_alias:?} uses risk profile {target_profile:?}, but \
+                 delegation requires the same risk profile as the caller ({:?}), or a target \
+                 whose profile is no broader",
+                self.security.risk_profile_name
+            )
+        };
+        if self.caller_alias.is_empty() {
+            return Err(same_profile_required());
+        }
+        let (Some(caller_grants), Some(target_grants)) = (
+            Self::profile_grants(config, &self.caller_alias),
+            Self::profile_grants(config, target_alias),
+        ) else {
+            return Err(same_profile_required());
+        };
+        // Narrowing gate: the target's grants must be no broader than the
+        // caller's. A BROADER target is a privilege escalation → refuse.
+        if let Err(escalation) = target_grants.ensure_no_escalation_beyond(&caller_grants) {
+            return Err(format!(
+                "delegate target {target_alias:?} (risk profile {target_profile:?}) would \
+                 escalate beyond the caller's profile ({:?}): {escalation}. Delegation is \
+                 narrowing-only — the target's permissions must be no broader than the caller's.",
+                self.security.risk_profile_name
+            ));
+        }
+        // `ensure_no_escalation_beyond` does not cover the tool allowlist;
+        // close that dimension explicitly.
+        if let Err(tool) = Self::target_tools_within_caller(&caller_grants, &target_grants) {
+            return Err(format!(
+                "delegate target {target_alias:?} may use tool {tool:?}, which the caller's \
+                 profile ({:?}) does not permit — delegation is narrowing-only.",
+                self.security.risk_profile_name
+            ));
+        }
+        // Agentic cross-profile guard: the in-process agentic delegate loop
+        // reuses the caller's `parent_tools` (bound to the caller's policy),
+        // so a different-profile agentic target would run tools under the
+        // CALLER's policy — an escalation. Non-agentic targets have no tool
+        // registry and are safe.
+        let target_agentic = config
+            .runtime_profiles
+            .get(target_agent.runtime_profile.trim())
+            .map(|rp| rp.agentic)
+            .unwrap_or(false);
+        if target_agentic {
+            return Err(format!(
+                "delegate target {target_alias:?} is agentic and on a different risk profile \
+                 ({target_profile:?}) than the caller ({:?}); cross-profile AGENTIC delegation \
+                 is not supported on the in-process delegate path (the agentic loop reuses the \
+                 caller's tool registry, bound to the caller's policy). Use spawn_subagent for a \
+                 narrowed agentic run, or place the target on the caller's risk profile.",
+                self.security.risk_profile_name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build a capability-grants-only policy for `alias` from its risk +
+    /// runtime profiles on a SHARED neutral workspace, for the narrowing
+    /// comparison in [`Self::cross_profile_decision`]. The shared workspace
+    /// cancels the per-agent workspace jail that [`SecurityPolicy::for_agent`]
+    /// would add (sibling agents on the same profile have non-overlapping
+    /// workspace roots — a false "escalation"). `None` when the agent or its
+    /// risk profile cannot be resolved.
+    fn profile_grants(config: &Config, alias: &str) -> Option<SecurityPolicy> {
+        let agent = config.agents.get(alias)?;
+        let risk = config.risk_profiles.get(agent.risk_profile.trim())?;
+        let runtime = config.runtime_profiles.get(agent.runtime_profile.trim());
+        Some(SecurityPolicy::from_profiles(
+            risk,
+            runtime,
+            Path::new("/__zc_delegate_grant_cmp__"),
+        ))
+    }
+
+    /// Returns `Err(tool)` if the target's EXPLICIT tool allowlist names a
+    /// tool the caller's profile does not permit (tool-authorization
+    /// broadening). Compares only when both profiles set an explicit
+    /// `allowed_tools` list: an empty profile list resolves to `None` ("no
+    /// authorization constraint"), left to the other gates (a non-agentic
+    /// target never runs tools; a cross-profile agentic target is refused
+    /// outright). Closes the `allowed_tools` dimension that
+    /// `ensure_no_escalation_beyond` does not cover, without false-refusing
+    /// the common empty-allowlist non-agentic delegate.
+    fn target_tools_within_caller(
+        caller: &SecurityPolicy,
+        target: &SecurityPolicy,
+    ) -> Result<(), String> {
+        if let (Some(_), Some(target_allow)) = (&caller.allowed_tools, &target.allowed_tools) {
+            for name in target_allow {
+                if !caller.is_tool_allowed(name) {
+                    return Err(name.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
@@ -560,14 +689,20 @@ impl Tool for DelegateTool {
         let delegation_permitted = self.security.delegation_policy.permits();
         let caller_profile = self.security.risk_profile_name.as_str();
         // Advertise only agents the caller can actually reach: delegation must
-        // be permitted, the target shares the caller's risk profile, and the
-        // delegator never lists itself.
+        // be permitted, the delegator never lists itself, and the target must
+        // pass the narrowing-only gate — same-profile, or a different profile
+        // that is no broader than the caller's and non-agentic (mirrors
+        // `cross_profile_decision`). Without `root_config` (legacy unit-test
+        // constructors) fall back to the same-profile filter.
         let mut agent_names: Vec<&str> = self
             .agents
             .iter()
             .filter(|_| delegation_permitted)
             .filter(|(name, _)| name.as_str() != self.caller_alias.as_str())
-            .filter(|(_, cfg)| cfg.risk_profile.trim() == caller_profile)
+            .filter(|(name, cfg)| match self.root_config.as_ref() {
+                Some(config) => self.cross_profile_decision(config, name).is_ok(),
+                None => cfg.risk_profile.trim() == caller_profile,
+            })
             .map(|(name, _)| name.as_str())
             .collect();
         agent_names.sort_unstable();
@@ -3825,10 +3960,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegate_rejects_target_on_a_different_risk_profile() {
-        // caller(narrow) is authorized to delegate to target, but target
-        // resolves onto the wider profile. Delegation requires caller and
-        // target to share a risk profile, so the boundary must refuse.
+    async fn delegate_refuses_broader_target_cross_profile() {
+        // caller(narrow, max_actions=5) is authorized to delegate, but target
+        // resolves onto the wider profile (max_actions=50). Delegation is
+        // narrowing-only, so a BROADER target is a privilege escalation and
+        // must be refused (the no-escalation invariant).
         let config = config_with_two_agents("caller", 5, "target", 50);
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -3837,15 +3973,16 @@ mod tests {
             delegate_agents.insert(name.clone(), agent.clone());
         }
         let tool = DelegateTool::new(delegate_agents, None, caller_policy)
-            .with_root_config(config.clone());
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
 
         let err = tool
             .policy_for_target("target")
-            .expect_err("cross-profile target must be rejected at delegate boundary");
+            .expect_err("a broader cross-profile target must be rejected");
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("requires the same risk profile as the caller"),
-            "expected same-profile rejection, got: {chain}"
+            chain.contains("narrowing-only") && chain.contains("escalate"),
+            "expected an escalation/narrowing rejection, got: {chain}"
         );
     }
 
@@ -3936,12 +4073,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegate_rejects_target_on_a_different_risk_profile_even_when_authorized() {
-        // DelegateTool's spawned agentic loop reuses the caller's
-        // parent_tools registry, so a target on a different profile would
-        // silently inherit the caller's allowlist. Even with the caller
-        // authorized to delegate to the target, the same-profile gate must
-        // catch the profile mismatch and refuse to dispatch.
+    async fn delegate_allows_narrower_nonagentic_target() {
+        // Option C: a non-agentic target on a DISTINCT, NARROWER profile
+        // (caller `broad` = [git, cargo]; target `narrow` = [git]) is no
+        // longer refused. It is dispatched and runs under its OWN (narrower)
+        // policy — a non-agentic delegate has no tool registry to inherit, so
+        // there is no escalation surface.
         let config = config_with_narrowed_target();
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
@@ -3950,15 +4087,17 @@ mod tests {
             delegate_agents.insert(name.clone(), agent.clone());
         }
         let tool = DelegateTool::new(delegate_agents, None, caller_policy)
-            .with_root_config(config.clone());
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
 
-        let err = tool
+        let resolved = tool
             .policy_for_target("target")
-            .expect_err("cross-profile target must be rejected at delegate boundary");
-        let chain = format!("{err:#}");
-        assert!(
-            chain.contains("requires the same risk profile as the caller"),
-            "expected same-profile rejection, got: {chain}"
+            .expect("a narrower non-agentic cross-profile target must be allowed");
+        // The dispatched policy is the TARGET's own (least-privilege), not
+        // the caller's broader profile.
+        assert_eq!(
+            resolved.risk_profile_name, "narrow",
+            "delegate must run under the target's narrow policy, not the caller's"
         );
     }
 
@@ -4089,6 +4228,236 @@ model_provider = "zai.comment"
                 .provider_api_url,
             inherited.provider_api_url,
             "bare alias (no family.alias) → inherited options"
+        );
+    }
+
+    // ── Option C: cross-profile narrowing gate ──────────────────────────────
+
+    /// caller `broad` ([git, cargo], delegation allow) → target `narrow`
+    /// ([git]) on an AGENTIC runtime profile. Narrower on commands, but the
+    /// agentic loop would reuse the caller's tool registry, so it must refuse.
+    fn config_narrower_agentic_target() -> Arc<zeroclaw_config::schema::Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "broad".to_string(),
+            RiskProfileConfig {
+                allowed_commands: vec!["git".into(), "cargo".into()],
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "narrow".to_string(),
+            RiskProfileConfig {
+                allowed_commands: vec!["git".into()],
+                allowed_tools: vec!["shell".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic_narrow".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "broad".to_string(),
+                model_provider: "ollama.caller".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "narrow".to_string(),
+                runtime_profile: "agentic_narrow".to_string(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Arc::new(config)
+    }
+
+    /// caller `restricted` (allowed_tools=[read_file], delegation allow) →
+    /// target `wider_tools` (allowed_tools=[read_file, shell]). Same
+    /// commands/caps; ONLY the tool allowlist broadens. Both non-agentic.
+    fn config_tool_broadening() -> Arc<zeroclaw_config::schema::Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "restricted".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["read_file".into()],
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "wider_tools".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["read_file".into(), "shell".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "restricted".to_string(),
+                model_provider: "ollama.caller".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "wider_tools".to_string(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn delegate_refuses_agentic_cross_profile() {
+        // An AGENTIC target on a different (even narrower) profile is refused:
+        // the in-process agentic loop reuses the caller's tool registry, so it
+        // cannot safely run under the target's policy. Narrowed agentic runs
+        // go through spawn_subagent / a shared profile.
+        let config = config_narrower_agentic_target();
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let err = tool
+            .policy_for_target("target")
+            .expect_err("agentic cross-profile target must be refused");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("AGENTIC") && chain.contains("spawn_subagent"),
+            "expected agentic-cross-profile refusal, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_refuses_tool_allowlist_broadening() {
+        // ensure_no_escalation_beyond does not cover the tool allowlist; a
+        // target whose explicit allowed_tools names a tool the caller cannot
+        // use (shell) is a tool-authorization escalation and must be refused.
+        let config = config_tool_broadening();
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let err = tool
+            .policy_for_target("target")
+            .expect_err("a target whose tool allowlist exceeds the caller's must be refused");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("narrowing-only"),
+            "expected tool-broadening refusal, got: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_forbidden_policy_blocks_before_narrowing() {
+        // Gate 1 (operator on/off switch) is preserved: a caller whose
+        // delegation_policy forbids delegation is refused even for an
+        // otherwise-narrower target. config_with_narrowed_target's `broad`
+        // profile sets allow; flip the caller's resolved policy to forbidden.
+        let config = config_with_narrowed_target();
+        let mut caller = SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves");
+        caller.delegation_policy = zeroclaw_config::autonomy::DelegationPolicy {
+            mode: zeroclaw_config::autonomy::DelegationMode::Forbidden,
+        };
+        let caller_policy = Arc::new(caller);
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let err = tool
+            .policy_for_target("target")
+            .expect_err("forbidden delegation_policy must block");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("forbidden by the caller's delegation_policy"),
+            "expected delegation_policy refusal, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn parameters_schema_advertises_narrower_nonagentic_target() {
+        // The roster advertisement mirrors the gate: a narrower non-agentic
+        // target IS reachable and must be advertised.
+        let config = config_with_narrowed_target();
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            desc.contains("target"),
+            "narrower non-agentic target must be advertised: {desc}"
+        );
+    }
+
+    #[test]
+    fn parameters_schema_hides_broader_target() {
+        // A broader cross-profile target is unreachable and must NOT be
+        // advertised (so the orchestrator never proposes an escalating call).
+        let config = config_with_two_agents("caller", 5, "target", 50);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["agent"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !desc.contains("target"),
+            "broader target must NOT be advertised: {desc}"
         );
     }
 }
